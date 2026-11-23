@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>bouncemarket</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; background: #111; color: #eee; }
+    canvas { background: #222; display: block; margin: 16px auto; }
+    button { font-size: 18px; padding: 8px 24px; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <p>Left: <span id="left">0</span> &nbsp;|&nbsp; Right: <span id="right">0</span></p>
+  <button id="drop">Drop</button>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const button = document.getElementById("drop");
+    const FPS = 60;  // the server sends one ball position per 1/60 second
+    let board;
+
+    function circle(x, y, r, color) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+
+    // Draw the pins and divider, plus the ball if a position is given.
+    function draw(ball) {
+      ctx.clearRect(0, 0, board.width, board.height);
+      ctx.strokeStyle = "#888";
+      ctx.beginPath();
+      ctx.moveTo(board.width / 2, board.last_row_y);
+      ctx.lineTo(board.width / 2, board.height);
+      ctx.stroke();
+      for (const [x, y] of board.pins) circle(x, y, board.pin_r, "#888");
+      if (ball) circle(ball[0], ball[1], board.ball_r, "#fc3");
+    }
+
+    function showCounts(counts) {
+      document.getElementById("left").textContent = counts.left;
+      document.getElementById("right").textContent = counts.right;
+    }
+
+    // Play back the path the server computed, then reveal the new counts.
+    function animate(result) {
+      const start = performance.now();
+      function frame(now) {
+        const i = Math.floor((now - start) / 1000 * FPS);
+        if (i < result.path.length) {
+          draw(result.path[i]);
+          requestAnimationFrame(frame);
+        } else {
+          draw(result.path[result.path.length - 1]);
+          showCounts(result.counts);
+          button.disabled = false;
+        }
+      }
+      requestAnimationFrame(frame);
+    }
+
+    button.onclick = async () => {
+      button.disabled = true;
+      const response = await fetch("/drop", { method: "POST" });
+      animate(await response.json());
+    };
+
+    async function init() {
+      const response = await fetch("/board");
+      board = await response.json();
+      canvas.width = board.width;
+      canvas.height = board.height;
+      draw();
+      showCounts(board.counts);
+    }
+    init();
+  </script>
+</body>
+</html>
