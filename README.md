@@ -10,7 +10,7 @@ A ball drops from a random spot, bounces off pins, and lands in one of two bucke
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-uv installs Flask (the only Python dependency, declared at the top of `app.py`) automatically on first run.
+uv installs the Python dependencies (Flask and the waitress web server, declared at the top of `app.py`) automatically on first run.
 
 ## Run locally
 
@@ -19,6 +19,10 @@ uv run app.py
 ```
 
 Then open http://localhost:8000.
+
+## Deploy
+
+The app is hosted on [Render](https://render.com), which reads `render.yaml`, installs `requirements.txt`, and runs `python app.py`. Every push to `main` redeploys it.
 
 ## How to play
 

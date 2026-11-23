@@ -1,0 +1,8 @@
+# Tells Render (render.com) how to build and run the app.
+services:
+  - type: web
+    name: bouncemarket
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py

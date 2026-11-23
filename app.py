@@ -1,12 +1,14 @@
 # /// script
-# dependencies = ["flask"]
+# dependencies = ["flask", "waitress"]  # keep in sync with requirements.txt
 # ///
 import argparse
 import math
+import os
 import random
 import time
 
 from flask import Flask, jsonify, request, send_file
+from waitress import serve
 
 # Board geometry, in pixels. (0, 0) is the top-left corner.
 WIDTH, HEIGHT = 400, 560
@@ -191,4 +193,5 @@ def settle_drop():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8000)
+    # Render tells us which port to listen on through the PORT environment variable.
+    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
