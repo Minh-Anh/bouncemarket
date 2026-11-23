@@ -49,7 +49,9 @@
     const message = document.getElementById("message");
     const FPS = 60;  // the ball moves one frame every 1/60 second
     let board;
-    let queue = [];  // snapshots of the falling ball, waiting until their frame is due
+    let game = null;  // the latest public message: the state of the shared game
+    let me = null;  // the latest private message: this player's points and bets
+    let queue = [];  // ball positions waiting until their frame is due, each [frame, x, y]
     let dropStart = null;  // on our clock, the moment the ball dropped
 
     // A random id, remembered by this browser, that tells the server which player we are.
@@ -78,53 +80,53 @@
       if (ball) circle(ball[0], ball[1], board.ball_r, "#fc3");
     }
 
-    // Show one snapshot from the server: everything this player can see right now.
-    function show(snapshot) {
-      draw(snapshot.ball);
-      document.getElementById("points").textContent = snapshot.points;
-      document.getElementById("left").textContent = snapshot.landed.left;
-      document.getElementById("right").textContent = snapshot.landed.right;
-      document.getElementById("online").textContent = snapshot.online;
+    // Show everything except the ball, from the latest public and private messages.
+    function render() {
+      if (!game || !me) return;
+      document.getElementById("points").textContent = me.points;
+      document.getElementById("left").textContent = game.landed.left;
+      document.getElementById("right").textContent = game.landed.right;
+      document.getElementById("online").textContent = game.online;
 
-      // What each point on a side gets back if that side wins: the whole pot divided by
-      // the points bet on that side.
-      const mine = snapshot.bets;
-      const others = snapshot.others;
+      // game.totals is everyone's bets on each side, ours included. What each point on a side
+      // gets back if that side wins is the whole pot divided by the points bet on that side.
+      const mine = me.bets;
       const myTotal = mine.left + mine.right;
-      const pot = myTotal + others.left + others.right;
+      const pot = game.totals.left + game.totals.right;
       for (const side of ["left", "right"]) {
-        const onSide = mine[side] + others[side];
+        const onSide = game.totals[side];
         document.getElementById("bet-" + side).textContent = mine[side];
-        document.getElementById("others-" + side).textContent = others[side];
+        // Our own bet can be a moment newer than the totals, so don't let this dip below zero.
+        document.getElementById("others-" + side).textContent = Math.max(0, onSide - mine[side]);
         document.getElementById("pays-" + side).textContent = onSide ? "×" + (pot / onSide).toFixed(2) : "–";
       }
 
       // Bets can go up while betting is open, and down only before the ball drops.
       for (const betButton of document.querySelectorAll(".side button")) {
         if (betButton.dataset.change === "1") {
-          betButton.disabled = !snapshot.betting_open || myTotal + 1 > snapshot.points;
+          betButton.disabled = !game.betting_open || myTotal + 1 > me.points;
         } else {
-          betButton.disabled = snapshot.dropping || mine[betButton.dataset.side] === 0;
+          betButton.disabled = game.dropping || mine[betButton.dataset.side] === 0;
         }
       }
 
-      if (snapshot.dropping) {
-        message.textContent = snapshot.betting_open ? "Betting is open: you can still add to your bets" : "Betting closed";
+      if (game.dropping) {
+        message.textContent = game.betting_open ? "Betting is open: you can still add to your bets" : "Betting closed";
       } else {
-        let text = `Next drop in ${Math.ceil(snapshot.seconds_to_drop)}`;
-        if (snapshot.last_bucket) {
-          const sign = snapshot.last_won > 0 ? "+" : "";
-          text = `Landed ${snapshot.last_bucket}: ${sign}${snapshot.last_won} points. ` + text;
+        let text = `Next drop in ${Math.ceil(game.seconds_to_drop)}`;
+        if (game.last_bucket) {
+          const sign = me.last_won > 0 ? "+" : "";
+          text = `Landed ${game.last_bucket}: ${sign}${me.last_won} points. ` + text;
         }
         message.textContent = text;
       }
     }
 
     // Each plus/minus button asks the server to change one side's bet by one.
-    // The new bet shows up in the next snapshot.
+    // The server answers with our new points and bets.
     for (const betButton of document.querySelectorAll(".side button")) {
-      betButton.onclick = () => {
-        fetch("/bet", {
+      betButton.onclick = async () => {
+        const response = await fetch("/bet", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -133,34 +135,37 @@
             change: Number(betButton.dataset.change),
           }),
         });
+        if (response.ok) {
+          me = await response.json();
+          render();
+        }
       };
     }
 
-    // While the ball is falling, the server sends each snapshot a few frames early. We queue
-    // them as they arrive and play them back on our own clock, so uneven arrival times
-    // don't make the ball stutter. Between drops there is nothing to smooth, so we show
-    // each snapshot straight away.
-    function receive(snapshot) {
-      if (!snapshot.dropping) {
+    // The public "game" message arrives 10 times a second. While the ball is falling, each
+    // one carries the next few ball positions, a little ahead of time. We queue them and
+    // play them back on our own clock, so uneven arrival times don't make the ball stutter.
+    function receiveGame(update) {
+      game = update;
+      render();
+      if (!game.dropping) {
         queue = [];
         dropStart = null;
-        show(snapshot);
+        draw(game.ball);
         return;
       }
-      if (dropStart === null) {
-        const framesSinceDrop = snapshot.frame - board.buffer_frames;
-        dropStart = performance.now() - framesSinceDrop * 1000 / FPS;
-      }
-      queue.push(snapshot);
+      // game.frame is the frame the server is on right now, which tells us when the drop began.
+      if (dropStart === null) dropStart = performance.now() - game.frame * 1000 / FPS;
+      game.positions.forEach(([x, y], i) => queue.push([game.first_position + i, x, y]));
     }
 
-    // Runs before every screen refresh: show the newest queued snapshot whose frame is due.
+    // Runs before every screen refresh: draw the newest queued position whose frame is due.
     function play(now) {
       if (dropStart !== null) {
         const dueFrame = (now - dropStart) / 1000 * FPS;
         let latest = null;
-        while (queue.length > 0 && queue[0].frame <= dueFrame) latest = queue.shift();
-        if (latest) show(latest);
+        while (queue.length > 0 && queue[0][0] <= dueFrame) latest = queue.shift();
+        if (latest) draw([latest[1], latest[2]]);
       }
       requestAnimationFrame(play);
     }
@@ -170,10 +175,13 @@
       board = await response.json();
       canvas.width = board.width;
       canvas.height = board.height;
-      // The server sends a stream of snapshots for as long as the page is open.
+      draw(null);
+      // The server sends a stream of messages for as long as the page is open: a private
+      // "me" message with our points and bets, and the public "game" message.
       // If the connection drops, the browser reconnects by itself.
       const stream = new EventSource("/events?player=" + playerId);
-      stream.onmessage = (event) => receive(JSON.parse(event.data));
+      stream.addEventListener("me", (event) => { me = JSON.parse(event.data); render(); });
+      stream.addEventListener("game", (event) => receiveGame(JSON.parse(event.data)));
       requestAnimationFrame(play);
     }
     init();

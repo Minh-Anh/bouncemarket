@@ -1,16 +1,19 @@
 # /// script
-# dependencies = ["flask", "waitress"]  # keep in sync with requirements.txt
+# dependencies = ["starlette", "uvicorn"]  # keep in sync with requirements.txt
 # ///
 import argparse
+import asyncio
+import contextlib
 import json
 import math
 import os
 import random
-import threading
 import time
 
-from flask import Flask, Response, jsonify, request, send_file
-from waitress import serve
+import uvicorn
+from starlette.applications import Starlette
+from starlette.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.routing import Route
 
 # Board geometry, in pixels. (0, 0) is the top-left corner.
 WIDTH, HEIGHT = 400, 560
@@ -29,7 +32,8 @@ BOUNCE = args.bounce
 DT = 1 / 240  # seconds per physics step
 STEPS_PER_FRAME = 4  # the page is sent one ball position per frame
 FRAME_SECONDS = STEPS_PER_FRAME * DT  # 1/60 second
-BUFFER_FRAMES = 5  # the ball's position is sent this many frames early, so the page can play back smoothly
+BROADCASTS_PER_SECOND = 10  # how often every page is sent the state of the game
+BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the page can play back smoothly
 COUNTERPARTY_BUY_FRAMES = 30  # the counterparty buys every 30 frames, which is 0.5 seconds
 COUNTDOWN_SECONDS = 5  # the wait between one ball landing and the next one dropping
 
@@ -49,30 +53,31 @@ def make_pins():
 PINS = make_pins()
 
 # Everything below lives in memory for now, so it resets when the server restarts.
+# The whole server runs on one thread (see the bottom of the file), so none of it needs locks.
 
 # The one shared game that every player watches and bets on. Rounds repeat forever:
 # a countdown, then a ball drops. "path" is the ball's position at every frame (None
-# before the first drop), "bucket" is where it lands, and betting closes when it reaches
-# "close_frame". Players only learn the path one frame at a time, and the bucket when
-# the ball lands.
+# before the first drop) and "bucket" is where it lands. Pages are sent the path a few
+# frames at a time, and the bucket when the ball lands.
 game = {
     "dropping": False,
     "drops_at": time.time() + COUNTDOWN_SECONDS,  # when the countdown ends
     "started_at": 0,  # when the ball dropped
     "path": None,
     "bucket": None,
-    "close_frame": 0,
+    "close_frame": 0,  # betting closes when the ball reaches this frame
+    "sent_frames": 0,  # how many frames of the path have been sent to the pages so far
+    "bets": {"left": 0, "right": 0},  # all the players' bets on this round, added up
     "last_bucket": None,  # where the previous ball landed
     "landed": {"left": 0, "right": 0},  # how many balls have landed in each bucket
 }
 
 # One entry per player, keyed by the random id their browser sends:
-# {"points": 10, "bets": {"left": 0, "right": 0}, "last_won": 0, "seen_at": 0}
+# {"points": 10, "bets": {"left": 0, "right": 0}, "last_won": 0}
 players = {}
 
-# Requests and the round loop run on different threads. Each takes this lock before
-# touching game or players, so they never see each other's half-finished changes.
-lock = threading.Lock()
+# One entry per open page: a queue of messages waiting to be sent to it, and whose page it is.
+streams = {}  # {queue: player_id}
 
 
 def simulate_drop():
@@ -120,18 +125,10 @@ def simulate_drop():
     return path, bucket
 
 
-app = Flask(__name__)
-
-
-@app.get("/")
-def index():
-    return send_file("index.html")
-
-
 def get_player(player_id):
     """Look up a player, creating them with 10 points the first time we see their id."""
     if player_id not in players:
-        players[player_id] = {"points": 10, "bets": {"left": 0, "right": 0}, "last_won": 0, "seen_at": 0}
+        players[player_id] = {"points": 10, "bets": {"left": 0, "right": 0}, "last_won": 0}
     return players[player_id]
 
 
@@ -153,19 +150,27 @@ def counterparty_bets(path, frames):
     return bets
 
 
+def sse(event, data):
+    """Format one server-sent event, the browser's built-in format for a stream of messages."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def send(queue, message):
+    """Queue a message for one page. A page that has fallen far behind misses it instead."""
+    if not queue.full():
+        queue.put_nowait(message)
+
+
 def settle():
-    """Pay out every player's bets on the ball that just landed.
+    """Pay out every player's bets on the ball that just landed, and tell each page its result.
 
     All bets, the players' and the counterparty's, go into one pot. The pot is split among
     the points bet on the winning bucket, so players can only win what others lose.
     """
     bucket = game["bucket"]
     theirs = counterparty_bets(game["path"], game["close_frame"])
-    pot = theirs["left"] + theirs["right"]
-    winning_points = theirs[bucket]
-    for player in players.values():
-        pot += player["bets"]["left"] + player["bets"]["right"]
-        winning_points += player["bets"][bucket]
+    pot = theirs["left"] + theirs["right"] + game["bets"]["left"] + game["bets"]["right"]
+    winning_points = theirs[bucket] + game["bets"][bucket]
 
     for player in players.values():
         my_total = player["bets"]["left"] + player["bets"]["right"]
@@ -177,123 +182,156 @@ def settle():
         player["points"] = round(player["points"] + player["last_won"], 2)
         player["bets"] = {"left": 0, "right": 0}
 
+    game["bets"] = {"left": 0, "right": 0}
     game["last_bucket"] = bucket
     game["landed"][bucket] += 1
+    for queue, player_id in streams.items():
+        send(queue, sse("me", players[player_id]))
 
 
-def run_rounds():
+async def run_rounds():
     """The round loop: wait for the countdown, drop a ball, wait for it to land, pay out. Forever."""
     while True:
-        time.sleep(COUNTDOWN_SECONDS)
+        await asyncio.sleep(COUNTDOWN_SECONDS)
         path, bucket = simulate_drop()
-        close_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
-        with lock:
-            game.update(dropping=True, started_at=time.time(), path=path, bucket=bucket, close_frame=close_frame)
-        time.sleep(len(path) * FRAME_SECONDS)
-        with lock:
-            settle()
-            game["dropping"] = False
-            game["drops_at"] = time.time() + COUNTDOWN_SECONDS
+        last_row_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
+        game.update(
+            dropping=True,
+            started_at=time.time(),
+            path=path,
+            bucket=bucket,
+            # Pages see BUFFER_FRAMES ahead, so betting closes that long before the ball
+            # passes the last row. Nobody can bet after seeing which side of the divider it took.
+            close_frame=max(0, last_row_frame - BUFFER_FRAMES),
+            sent_frames=0,
+        )
+        await asyncio.sleep(len(path) * FRAME_SECONDS)
+        settle()
+        game["dropping"] = False
+        game["drops_at"] = time.time() + COUNTDOWN_SECONDS
 
 
-def snapshot(player_id):
-    """Everything one player's page shows.
+async def broadcast():
+    """Send every page the public state of the game, several times a second.
 
-    While the ball is falling, the snapshot describes the game BUFFER_FRAMES ahead of now.
-    The page holds each snapshot until its frame is due, so it always has a few in hand and
-    can play them back smoothly even when the network delivers them unevenly. That is as
-    far ahead of time as a page ever sees.
+    The message is built once and the same text goes to everyone. While the ball is falling
+    it carries the next few positions on the path, up to BUFFER_FRAMES ahead of now. The page
+    plays them back on its own clock, so it always has some in hand and the ball moves
+    smoothly even when the network delivers messages unevenly.
     """
-    with lock:
-        now = time.time()
-        player = get_player(player_id)
-        player["seen_at"] = now
-        path, frame = game["path"], current_frame()
-        if game["dropping"]:
-            frame += BUFFER_FRAMES
-
-        # "others" is what everyone except this player has bet: the counterparty plus the other players.
-        if game["dropping"]:
-            others = counterparty_bets(path, min(frame + 1, game["close_frame"]))
-        else:
-            others = {"left": 0, "right": 0}
-        for other in players.values():
-            if other is not player:
-                others["left"] += other["bets"]["left"]
-                others["right"] += other["bets"]["right"]
-
-        return {
+    while True:
+        await asyncio.sleep(1 / BROADCASTS_PER_SECOND)
+        path = game["path"]
+        message = {
             "dropping": game["dropping"],
-            "frame": frame,  # the frame this snapshot describes
-            "seconds_to_drop": max(0, game["drops_at"] - now),
-            # Between drops the ball rests where it landed.
-            "ball": path[min(frame, len(path) - 1)] if path else None,
-            "betting_open": not game["dropping"] or frame < game["close_frame"],
-            "points": player["points"],
-            "bets": player["bets"],
-            "others": others,
-            "online": sum(1 for p in players.values() if now - p["seen_at"] < 2),
+            "seconds_to_drop": max(0, game["drops_at"] - time.time()),
+            "totals": dict(game["bets"]),  # every bet on each side; the counterparty's are added below
+            "online": len(streams),
             "last_bucket": game["last_bucket"],
-            "last_won": player["last_won"],
             "landed": game["landed"],
         }
+        if game["dropping"]:
+            frame = current_frame()
+            theirs = counterparty_bets(path, min(frame + 1, game["close_frame"]))
+            message["totals"]["left"] += theirs["left"]
+            message["totals"]["right"] += theirs["right"]
+            message["betting_open"] = frame < game["close_frame"]
+            # The positions the pages don't have yet, and the frame number of the first of them.
+            end = min(frame + BUFFER_FRAMES + 1, len(path))
+            message["frame"] = frame
+            message["first_position"] = game["sent_frames"]
+            message["positions"] = path[game["sent_frames"]:end]
+            game["sent_frames"] = end
+        else:
+            message["betting_open"] = True
+            message["ball"] = path[-1] if path else None  # between drops the ball rests where it landed
+
+        text = sse("game", message)
+        for queue in streams:
+            send(queue, text)
 
 
-@app.get("/board")
-def board():
-    return jsonify(
-        width=WIDTH,
-        height=HEIGHT,
-        ball_r=BALL_R,
-        pin_r=PIN_R,
-        last_row_y=LAST_ROW_Y,
-        pins=PINS,
-        buffer_frames=BUFFER_FRAMES,
-    )
+async def index(request):
+    return FileResponse("index.html")
 
 
-@app.get("/events")
-def events():
-    """Stream snapshots to one player's page for as long as it stays open.
+async def board(request):
+    return JSONResponse({
+        "width": WIDTH,
+        "height": HEIGHT,
+        "ball_r": BALL_R,
+        "pin_r": PIN_R,
+        "last_row_y": LAST_ROW_Y,
+        "pins": PINS,
+    })
 
-    These are server-sent events, the browser's built-in format for a stream of messages.
-    While the ball is falling we send 60 snapshots a second; otherwise 10 is plenty.
+
+async def events(request):
+    """Stream messages to one player's page for as long as it stays open.
+
+    The page gets a private "me" message (its points and bets) when it connects and after
+    each round, and the public "game" message from broadcast().
     """
-    player_id = request.args["player"]
+    player_id = request.query_params["player"][:64]
+    player = get_player(player_id)
 
-    def stream():
-        while True:
-            yield f"data: {json.dumps(snapshot(player_id))}\n\n"
-            time.sleep(FRAME_SECONDS if game["dropping"] else 0.1)
+    async def stream():
+        queue = asyncio.Queue(maxsize=100)
+        streams[queue] = player_id
+        try:
+            yield sse("me", player)
+            while True:
+                yield await queue.get()
+        finally:
+            del streams[queue]  # the page has gone away
 
     # The headers ask anything between the server and the browser not to hold events back.
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    return Response(stream(), mimetype="text/event-stream", headers=headers)
+    return StreamingResponse(stream(), media_type="text/event-stream", headers=headers)
 
 
-@app.post("/bet")
-def bet():
+async def bet(request):
     """Change a player's bet on one side by one point. While the ball is falling, bets can only go up."""
-    side, change = request.json["side"], request.json["change"]
+    data = await request.json()
+    side, change = data["side"], data["change"]
     if side not in ("left", "right") or change not in (1, -1):
-        return jsonify(error="Bad bet."), 400
-    with lock:
-        player = get_player(request.json["player"])
-        bets = player["bets"]
-        if game["dropping"] and change < 0:
-            return jsonify(error="Bets can't be lowered once the ball drops."), 400
-        if game["dropping"] and current_frame() >= game["close_frame"]:
-            return jsonify(error="Betting is closed."), 400
-        if bets[side] + change < 0:
-            return jsonify(error="Bets can't be negative."), 400
-        if bets["left"] + bets["right"] + change > player["points"]:
-            return jsonify(error="You can't bet more than your points."), 400
-        bets[side] += change
-    return jsonify(ok=True)
+        return JSONResponse({"error": "Bad bet."}, status_code=400)
+    player = get_player(data["player"][:64])
+    bets = player["bets"]
+    if game["dropping"] and change < 0:
+        return JSONResponse({"error": "Bets can't be lowered once the ball drops."}, status_code=400)
+    if game["dropping"] and current_frame() >= game["close_frame"]:
+        return JSONResponse({"error": "Betting is closed."}, status_code=400)
+    if bets[side] + change < 0:
+        return JSONResponse({"error": "Bets can't be negative."}, status_code=400)
+    if bets["left"] + bets["right"] + change > player["points"]:
+        return JSONResponse({"error": "You can't bet more than your points."}, status_code=400)
+    bets[side] += change
+    game["bets"][side] += change
+    return JSONResponse(player)
 
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    """Start the round loop and the broadcaster when the server starts."""
+    tasks = [asyncio.create_task(run_rounds()), asyncio.create_task(broadcast())]
+    yield
+    for task in tasks:
+        task.cancel()
+
+
+app = Starlette(
+    routes=[
+        Route("/", index),
+        Route("/board", board),
+        Route("/events", events),
+        Route("/bet", bet, methods=["POST"]),
+    ],
+    lifespan=lifespan,
+)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_rounds, daemon=True).start()
-    # Render tells us which port to listen on through the PORT environment variable.
-    # Every open page holds one thread for its stream, so this is the most players at once.
-    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), threads=100)
+    # uvicorn runs everything on one thread, switching between pages whenever one is waiting,
+    # so thousands of open pages are cheap. Render tells us the port through the PORT variable.
+    # The short shutdown timeout lets Ctrl-C work while pages still have streams open.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), timeout_graceful_shutdown=1)
