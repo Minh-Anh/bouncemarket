@@ -34,7 +34,7 @@ uv run app.py --gravity 1500 --bounce 0.3
 
 | Option      | Default | Meaning                                                        |
 | ----------- | ------- | -------------------------------------------------------------- |
-| `--gravity` | 1200    | Downward acceleration, in pixels / second². Higher is faster.  |
-| `--bounce`  | 0.5     | Fraction of speed kept after hitting a pin or wall, 0 to 1. Lower makes the ball slow down more in the dense rows. |
+| `--gravity` | 400     | Downward acceleration, in pixels / second². Higher is faster.  |
+| `--bounce`  | 0.8     | Fraction of speed kept after hitting a pin or wall, 0 to 1. Lower makes the ball slow down more in the dense rows. |
 
 Everything else (board size, pin rows, ball and pin size) is a constant at the top of `app.py`.
