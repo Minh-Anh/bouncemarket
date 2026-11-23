@@ -26,17 +26,21 @@ The app is hosted on [Render](https://render.com), which reads `render.yaml`, in
 
 ## How to play
 
+Everyone who opens the page watches the same ball and bets into the same market. A new ball drops 5 seconds after the last one lands.
+
 You start with 10 points. Use the plus and minus buttons to bet points on left, right, or both, as long as the bets add up to no more than your points.
 
 Betting stays open after the drop: while the ball is falling you can add to either bet (but not lower it) until the ball passes the last row of pins.
 
-You play against a counterparty with a simple strategy: it bets one point on whichever half of the board the ball starts in, then one more point every 0.5 seconds on whichever half the ball is in at that moment, until betting closes.
+Besides the other players, there is a counterparty with a simple strategy: it bets one point on whichever half of the board the ball starts in, then one more point every 0.5 seconds on whichever half the ball is in at that moment, until betting closes. "Others" under each side is the total bet there by the counterparty and every other player.
 
-There is no house. All bets, yours and the counterparty's, go into one pot, and when the ball lands the pot is split among the points bet on the winning bucket. So you can only win what the counterparty loses, a crowded side pays little per point, and an empty side pays a lot. The "Pays" number under each side is what one point on that side gets back if it wins, given the bets so far. If nobody bet on the winning bucket, everyone gets their bets back.
+There is no house. All bets go into one pot, and when the ball lands the pot is split among the points bet on the winning bucket. So you can only win what others lose, a crowded side pays little per point, and an empty side pays a lot. The "Pays" number under each side is what one point on that side gets back if it wins, given the bets so far. If nobody bet on the winning bucket, everyone gets their bets back.
 
 ## How it works
 
-The server simulates the whole drop the moment you click Drop, but keeps the result to itself. It streams the ball's position to the page 60 times a second (as [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)), so the page only ever knows where the ball is now, and learns the bucket when the ball lands.
+The server runs one game for everyone. It simulates each drop in full the moment the ball is released, but keeps the result to itself. Every open page gets a stream of snapshots (as [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)), 60 a second while the ball is falling, so a page learns the bucket only when the ball lands. Each snapshot is sent 5 frames (a twelfth of a second) early and the page plays them back on its own clock, which keeps the ball moving smoothly when the network delivers them unevenly. That is as far ahead as a page ever sees.
+
+Your browser remembers a random id that tells the server which player you are. Points live in the server's memory, so they reset whenever the server restarts.
 
 ## Tuning the physics
 
