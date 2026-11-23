@@ -4,6 +4,7 @@
 import argparse
 import math
 import random
+import time
 
 from flask import Flask, jsonify, request, send_file
 
@@ -23,6 +24,7 @@ GRAVITY = args.gravity
 BOUNCE = args.bounce
 DT = 1 / 240  # seconds per physics step
 STEPS_PER_FRAME = 4  # the page plays the path back at 60 frames per second
+COUNTERPARTY_BUY_FRAMES = 30  # the counterparty buys every 30 frames, which is 0.5 seconds
 
 
 def make_pins():
@@ -40,8 +42,14 @@ def make_pins():
 PINS = make_pins()
 
 # Game state. Lives in memory for now, so it resets when the server restarts.
-# "points" is the player's balance; "left" and "right" count the balls landed in each bucket.
-state = {"points": 10, "left": 0, "right": 0}
+# "points" is the player's balance; "left" and "right" count the balls landed in each bucket;
+# "bets" is how many points the player has bet on each bucket for the current drop.
+state = {"points": 10, "left": 0, "right": 0, "bets": {"left": 0, "right": 0}}
+
+# The ball that is falling right now. "bucket" is where it will land, or None if no ball
+# is falling. The page is never told the bucket until the drop is settled.
+# "counterparty" is how many points the counterparty bets on each bucket during this drop.
+ball = {"bucket": None, "betting_closes_at": 0, "counterparty": {"left": 0, "right": 0}}
 
 
 def simulate_drop():
@@ -97,8 +105,34 @@ def index():
     return send_file("index.html")
 
 
+def settle():
+    """Pay out the bets on the falling ball, if there is one. Returns (bucket, points won).
+
+    All bets, the player's and the counterparty's, go into one pot. The pot is split among
+    the points bet on the winning bucket, so the player can only win what the counterparty loses.
+    """
+    bucket = ball["bucket"]
+    if bucket is None:
+        return None, 0
+    bets, theirs = state["bets"], ball["counterparty"]
+    my_total = bets["left"] + bets["right"]
+    pot = my_total + theirs["left"] + theirs["right"]
+    winning_points = bets[bucket] + theirs[bucket]
+    if winning_points == 0:
+        payout = my_total  # nobody bet on the winning bucket, so everyone gets their bet back
+    else:
+        payout = pot * bets[bucket] / winning_points
+    won = round(payout - my_total, 2)
+    state["points"] = round(state["points"] + won, 2)
+    state[bucket] += 1
+    state["bets"] = {"left": 0, "right": 0}
+    ball["bucket"] = None
+    return bucket, won
+
+
 @app.get("/board")
 def board():
+    settle()  # in case the page was reloaded in the middle of a drop
     return jsonify(
         width=WIDTH,
         height=HEIGHT,
@@ -112,19 +146,48 @@ def board():
 
 @app.post("/drop")
 def drop():
-    """Take a bet on each bucket, drop a ball, and pay out one point per point bet."""
-    bets = request.get_json()
-    left, right = bets["left"], bets["right"]
-    if type(left) is not int or type(right) is not int:
-        return jsonify(error="Bets must be whole numbers."), 400
-    if left < 0 or right < 0 or left + right > state["points"]:
-        return jsonify(error="Bets can't be negative or add up to more than your points."), 400
-
+    """Drop a ball. Betting stays open until the ball passes the last row of pins."""
+    settle()  # in case the previous drop was never settled
     path, bucket = simulate_drop()
-    won = left - right if bucket == "left" else right - left
-    state["points"] += won
-    state[bucket] += 1
-    return jsonify(path=path, bucket=bucket, won=won, state=state)
+    close_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
+    ball["bucket"] = bucket
+    ball["betting_closes_at"] = time.time() + close_frame * STEPS_PER_FRAME * DT
+
+    # The counterparty bets one point at the drop and one more every 0.5 seconds until betting
+    # closes, each time on whichever half of the board the ball is in at that moment.
+    buys = []
+    ball["counterparty"] = {"left": 0, "right": 0}
+    for frame in range(0, close_frame, COUNTERPARTY_BUY_FRAMES):
+        side = "left" if path[frame][0] < WIDTH / 2 else "right"
+        buys.append((frame, side))
+        ball["counterparty"][side] += 1
+    return jsonify(path=path, close_frame=close_frame, counterparty_buys=buys)
+
+
+@app.post("/bet")
+def bet():
+    """Change the bet on one side by one point. While a ball is falling, bets can only go up."""
+    side, change = request.json["side"], request.json["change"]
+    bets = state["bets"]
+    if side not in ("left", "right") or change not in (1, -1):
+        return jsonify(error="Bad bet."), 400
+    if ball["bucket"] is not None and change < 0:
+        return jsonify(error="Bets can't be lowered once the ball drops."), 400
+    if ball["bucket"] is not None and time.time() > ball["betting_closes_at"]:
+        return jsonify(error="Betting is closed."), 400
+    if bets[side] + change < 0:
+        return jsonify(error="Bets can't be negative."), 400
+    if bets["left"] + bets["right"] + change > state["points"]:
+        return jsonify(error="You can't bet more than your points."), 400
+    bets[side] += change
+    return jsonify(state=state)
+
+
+@app.post("/settle")
+def settle_drop():
+    """Called by the page when the ball lands. Pays out and reveals the result."""
+    bucket, won = settle()
+    return jsonify(bucket=bucket, won=won, state=state)
 
 
 if __name__ == "__main__":
