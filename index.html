@@ -6,19 +6,52 @@
   <style>
     body { font-family: sans-serif; text-align: center; background: #111; color: #eee; }
     canvas { background: #222; display: block; margin: 16px auto; }
-    button { font-size: 18px; padding: 8px 24px; }
+    #bets { display: flex; width: 400px; margin: 0 auto; }
+    .side { flex: 1; }
+    .side button {
+      width: 56px; height: 56px; border: none; border-radius: 50%;
+      font-size: 32px; font-weight: bold; color: #111; cursor: pointer;
+    }
+    .side button:active { transform: scale(0.9); }
+    .side span { display: inline-block; width: 48px; font-size: 28px; font-weight: bold; }
+    #left-side button { background: #f9a8d4; }
+    #right-side button { background: #93c5fd; }
+    #drop {
+      font-size: 20px; font-weight: bold; padding: 12px 48px; margin-top: 16px;
+      border: none; border-radius: 28px; background: #fc3; color: #111; cursor: pointer;
+    }
+    #drop:disabled { opacity: 0.5; }
   </style>
 </head>
 <body>
   <canvas id="canvas"></canvas>
-  <p>Left: <span id="left">0</span> &nbsp;|&nbsp; Right: <span id="right">0</span></p>
+  <p>Points: <span id="points"></span></p>
+  <div id="bets">
+    <div class="side" id="left-side">
+      <p>Bet on left</p>
+      <button data-side="left" data-change="-1">&minus;</button>
+      <span id="bet-left">0</span>
+      <button data-side="left" data-change="1">+</button>
+    </div>
+    <div class="side" id="right-side">
+      <p>Bet on right</p>
+      <button data-side="right" data-change="-1">&minus;</button>
+      <span id="bet-right">0</span>
+      <button data-side="right" data-change="1">+</button>
+    </div>
+  </div>
   <button id="drop">Drop</button>
+  <p id="message">&nbsp;</p>
+  <p>Landed left: <span id="left"></span> &nbsp;|&nbsp; Landed right: <span id="right"></span></p>
 
   <script>
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
     const button = document.getElementById("drop");
+    const message = document.getElementById("message");
     const FPS = 60;  // the server sends one ball position per 1/60 second
+    const bets = { left: 0, right: 0 };
+    let points = 0;
     let board;
 
     function circle(x, y, r, color) {
@@ -40,12 +73,32 @@
       if (ball) circle(ball[0], ball[1], board.ball_r, "#fc3");
     }
 
-    function showCounts(counts) {
-      document.getElementById("left").textContent = counts.left;
-      document.getElementById("right").textContent = counts.right;
+    function showBets() {
+      document.getElementById("bet-left").textContent = bets.left;
+      document.getElementById("bet-right").textContent = bets.right;
     }
 
-    // Play back the path the server computed, then reveal the new counts.
+    // Each plus/minus button changes one side's bet by one, if the new bets are allowed.
+    for (const betButton of document.querySelectorAll(".side button")) {
+      betButton.onclick = () => {
+        if (button.disabled) return;  // a ball is dropping
+        const side = betButton.dataset.side;
+        const change = Number(betButton.dataset.change);
+        if (bets[side] + change >= 0 && bets.left + bets.right + change <= points) {
+          bets[side] += change;
+          showBets();
+        }
+      };
+    }
+
+    function showState(state) {
+      points = state.points;
+      document.getElementById("points").textContent = state.points;
+      document.getElementById("left").textContent = state.left;
+      document.getElementById("right").textContent = state.right;
+    }
+
+    // Play back the path the server computed, then reveal the result.
     function animate(result) {
       const start = performance.now();
       function frame(now) {
@@ -55,7 +108,11 @@
           requestAnimationFrame(frame);
         } else {
           draw(result.path[result.path.length - 1]);
-          showCounts(result.counts);
+          showState(result.state);
+          const sign = result.won > 0 ? "+" : "";
+          message.textContent = `Landed ${result.bucket}: ${sign}${result.won} points`;
+          bets.left = bets.right = 0;
+          showBets();
           button.disabled = false;
         }
       }
@@ -63,9 +120,19 @@
     }
 
     button.onclick = async () => {
+      const response = await fetch("/drop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bets),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        message.textContent = result.error;
+        return;
+      }
+      message.innerHTML = "&nbsp;";
       button.disabled = true;
-      const response = await fetch("/drop", { method: "POST" });
-      animate(await response.json());
+      animate(result);
     };
 
     async function init() {
@@ -74,7 +141,7 @@
       canvas.width = board.width;
       canvas.height = board.height;
       draw();
-      showCounts(board.counts);
+      showState(board.state);
     }
     init();
   </script>

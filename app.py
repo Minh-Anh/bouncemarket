@@ -5,7 +5,7 @@ import argparse
 import math
 import random
 
-from flask import Flask, jsonify, send_file
+from flask import Flask, jsonify, request, send_file
 
 # Board geometry, in pixels. (0, 0) is the top-left corner.
 WIDTH, HEIGHT = 400, 560
@@ -40,7 +40,8 @@ def make_pins():
 PINS = make_pins()
 
 # Game state. Lives in memory for now, so it resets when the server restarts.
-counts = {"left": 0, "right": 0}
+# "points" is the player's balance; "left" and "right" count the balls landed in each bucket.
+state = {"points": 10, "left": 0, "right": 0}
 
 
 def simulate_drop():
@@ -105,15 +106,25 @@ def board():
         pin_r=PIN_R,
         last_row_y=LAST_ROW_Y,
         pins=PINS,
-        counts=counts,
+        state=state,
     )
 
 
 @app.post("/drop")
 def drop():
+    """Take a bet on each bucket, drop a ball, and pay out one point per point bet."""
+    bets = request.get_json()
+    left, right = bets["left"], bets["right"]
+    if type(left) is not int or type(right) is not int:
+        return jsonify(error="Bets must be whole numbers."), 400
+    if left < 0 or right < 0 or left + right > state["points"]:
+        return jsonify(error="Bets can't be negative or add up to more than your points."), 400
+
     path, bucket = simulate_drop()
-    counts[bucket] += 1
-    return jsonify(path=path, bucket=bucket, counts=counts)
+    won = left - right if bucket == "left" else right - left
+    state["points"] += won
+    state[bucket] += 1
+    return jsonify(path=path, bucket=bucket, won=won, state=state)
 
 
 if __name__ == "__main__":

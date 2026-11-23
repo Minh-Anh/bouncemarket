@@ -20,6 +20,10 @@ uv run app.py
 
 Then open http://localhost:8000.
 
+## How to play
+
+You start with 10 points. Before each drop, bet any whole number of points on left, right, or both, as long as the bets add up to no more than your points. Each point bet on the bucket the ball lands in wins a point; each point bet on the other bucket loses a point.
+
 ## Tuning the physics
 
 Gravity and bounce can be passed on the command line:
