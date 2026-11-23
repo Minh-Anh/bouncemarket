@@ -52,6 +52,7 @@
     const ctx = canvas.getContext("2d");
     const button = document.getElementById("drop");
     const message = document.getElementById("message");
+    const FPS = 60;  // the server sends one ball position per 1/60 second
     let board;
     let myBets = { left: 0, right: 0 };
     let theirBets = { left: 0, right: 0 };
@@ -134,25 +135,50 @@
 
     // Ask the server to drop a ball, and listen to the stream of events it sends back:
     // a "frame" event for each new ball position, then one "result" event when it lands.
+    // The server sends each frame a little early. We keep the frames as they arrive and play
+    // them back on our own clock, so uneven arrival times don't make the ball stutter.
     button.onclick = () => {
       button.disabled = true;
       enableBetButtons(false, true);
       message.textContent = "Betting is open: you can still add to your bets";
       const stream = new EventSource("/drop");
+      const frames = [];
+      let start;  // when the first frame arrived
+      let shown = -1;  // index of the frame on screen
+      let playing = true;
+
+      // Show the frame that is due now, or the newest one we have if the stream has fallen behind.
+      function play(now) {
+        if (!playing) return;
+        const due = Math.floor((now - start) / 1000 * FPS);
+        const i = Math.min(due, frames.length - 1);
+        if (i > shown) {
+          shown = i;
+          const frame = frames[i];
+          draw([frame.x, frame.y]);
+          theirBets = frame.theirs;
+          showMarket();
+          if (!frame.betting_open) {
+            enableBetButtons(false, false);
+            message.textContent = "Betting closed";
+          }
+        }
+        requestAnimationFrame(play);
+      }
 
       stream.addEventListener("frame", (event) => {
-        const frame = JSON.parse(event.data);
-        draw([frame.x, frame.y]);
-        theirBets = frame.theirs;
-        showMarket();
-        if (!frame.betting_open) {
-          enableBetButtons(false, false);
-          message.textContent = "Betting closed";
+        frames.push(JSON.parse(event.data));
+        if (frames.length === 1) {
+          start = performance.now();
+          requestAnimationFrame(play);
         }
       });
 
       stream.addEventListener("result", (event) => {
         stream.close();
+        playing = false;
+        const last = frames[frames.length - 1];
+        draw([last.x, last.y]);
         const state = JSON.parse(event.data);
         const sign = state.last_won > 0 ? "+" : "";
         endDrop(`Landed ${state.last_bucket}: ${sign}${state.last_won} points`);
@@ -162,6 +188,7 @@
       // Without close(), the browser would reconnect and start another drop.
       stream.onerror = () => {
         stream.close();
+        playing = false;
         endDrop("Couldn't follow the drop. Try again in a moment.");
       };
     };

@@ -29,6 +29,7 @@ BOUNCE = args.bounce
 DT = 1 / 240  # seconds per physics step
 STEPS_PER_FRAME = 4  # the page is sent one ball position per frame
 FRAME_SECONDS = STEPS_PER_FRAME * DT  # 1/60 second
+BUFFER_FRAMES = 5  # each frame is sent this many frames early, so the page can play back smoothly
 COUNTERPARTY_BUY_FRAMES = 30  # the counterparty buys every 30 frames, which is 0.5 seconds
 
 
@@ -188,8 +189,10 @@ def board():
 def drop():
     """Drop a ball and stream it to the page as it falls.
 
-    The page gets a "frame" event 60 times a second with the ball's position right now,
-    then one "result" event when the ball lands. It never sees a position ahead of time.
+    The page gets a "frame" event 60 times a second, then one "result" event when the ball
+    lands. Each frame is sent BUFFER_FRAMES early, so the page always has a few in hand and
+    can play them back smoothly even when the network delivers them unevenly. That is as far
+    ahead of time as the page ever sees.
     """
     settle()  # in case a ball landed while nobody was watching
     if ball["path"] is not None:
@@ -200,7 +203,7 @@ def drop():
 
     def stream():
         for frame, (x, y) in enumerate(path):
-            time.sleep(max(0, seconds_until(frame)))
+            time.sleep(max(0, seconds_until(frame - BUFFER_FRAMES)))
             yield sse("frame", {
                 "x": x,
                 "y": y,
