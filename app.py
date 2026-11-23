@@ -2,12 +2,14 @@
 # dependencies = ["flask", "waitress"]  # keep in sync with requirements.txt
 # ///
 import argparse
+import json
 import math
 import os
 import random
+import threading
 import time
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
 from waitress import serve
 
 # Board geometry, in pixels. (0, 0) is the top-left corner.
@@ -25,7 +27,8 @@ args = parser.parse_args()
 GRAVITY = args.gravity
 BOUNCE = args.bounce
 DT = 1 / 240  # seconds per physics step
-STEPS_PER_FRAME = 4  # the page plays the path back at 60 frames per second
+STEPS_PER_FRAME = 4  # the page is sent one ball position per frame
+FRAME_SECONDS = STEPS_PER_FRAME * DT  # 1/60 second
 COUNTERPARTY_BUY_FRAMES = 30  # the counterparty buys every 30 frames, which is 0.5 seconds
 
 
@@ -45,13 +48,23 @@ PINS = make_pins()
 
 # Game state. Lives in memory for now, so it resets when the server restarts.
 # "points" is the player's balance; "left" and "right" count the balls landed in each bucket;
-# "bets" is how many points the player has bet on each bucket for the current drop.
-state = {"points": 10, "left": 0, "right": 0, "bets": {"left": 0, "right": 0}}
+# "bets" is how many points the player has bet on each bucket for the current drop;
+# "last_bucket" and "last_won" are the result of the most recent drop.
+state = {
+    "points": 10,
+    "left": 0,
+    "right": 0,
+    "bets": {"left": 0, "right": 0},
+    "last_bucket": None,
+    "last_won": 0,
+}
 
-# The ball that is falling right now. "bucket" is where it will land, or None if no ball
-# is falling. The page is never told the bucket until the drop is settled.
-# "counterparty" is how many points the counterparty bets on each bucket during this drop.
-ball = {"bucket": None, "betting_closes_at": 0, "counterparty": {"left": 0, "right": 0}}
+# The ball in play. "path" is its position at every frame, or None if there is no ball.
+# "bucket" is where it will land, and betting closes when it reaches "close_frame".
+# The page only learns the path one frame at a time, and the bucket when the ball lands.
+ball = {"path": None, "bucket": None, "close_frame": 0, "started_at": 0}
+
+settle_lock = threading.Lock()  # stops two requests paying out the same ball at once
 
 
 def simulate_drop():
@@ -107,34 +120,59 @@ def index():
     return send_file("index.html")
 
 
+def seconds_until(frame):
+    """How long until the ball in play reaches the given frame. Negative if it already has."""
+    return ball["started_at"] + frame * FRAME_SECONDS - time.time()
+
+
+def counterparty_bets(path, frames):
+    """How much the counterparty has bet on each bucket once the given number of frames have passed.
+
+    It bets one point at the drop and one more every 0.5 seconds, each time on whichever
+    half of the board the ball is in at that moment.
+    """
+    bets = {"left": 0, "right": 0}
+    for frame in range(0, frames, COUNTERPARTY_BUY_FRAMES):
+        side = "left" if path[frame][0] < WIDTH / 2 else "right"
+        bets[side] += 1
+    return bets
+
+
 def settle():
-    """Pay out the bets on the falling ball, if there is one. Returns (bucket, points won).
+    """If the ball in play has landed, pay out the bets on it.
 
     All bets, the player's and the counterparty's, go into one pot. The pot is split among
     the points bet on the winning bucket, so the player can only win what the counterparty loses.
     """
-    bucket = ball["bucket"]
-    if bucket is None:
-        return None, 0
-    bets, theirs = state["bets"], ball["counterparty"]
-    my_total = bets["left"] + bets["right"]
-    pot = my_total + theirs["left"] + theirs["right"]
-    winning_points = bets[bucket] + theirs[bucket]
-    if winning_points == 0:
-        payout = my_total  # nobody bet on the winning bucket, so everyone gets their bet back
-    else:
-        payout = pot * bets[bucket] / winning_points
-    won = round(payout - my_total, 2)
-    state["points"] = round(state["points"] + won, 2)
-    state[bucket] += 1
-    state["bets"] = {"left": 0, "right": 0}
-    ball["bucket"] = None
-    return bucket, won
+    with settle_lock:
+        path, bucket = ball["path"], ball["bucket"]
+        if path is None or seconds_until(len(path)) > 0:
+            return
+        bets = state["bets"]
+        theirs = counterparty_bets(path, ball["close_frame"])
+        my_total = bets["left"] + bets["right"]
+        pot = my_total + theirs["left"] + theirs["right"]
+        winning_points = bets[bucket] + theirs[bucket]
+        if winning_points == 0:
+            payout = my_total  # nobody bet on the winning bucket, so everyone gets their bet back
+        else:
+            payout = pot * bets[bucket] / winning_points
+        won = round(payout - my_total, 2)
+        state["points"] = round(state["points"] + won, 2)
+        state[bucket] += 1
+        state["bets"] = {"left": 0, "right": 0}
+        state["last_bucket"], state["last_won"] = bucket, won
+        ball["path"] = None
+
+
+def sse(event, data):
+    """Format one server-sent event, the browser's built-in format for a stream of messages."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 @app.get("/board")
 def board():
-    settle()  # in case the page was reloaded in the middle of a drop
+    settle()  # in case a ball landed while nobody was watching
     return jsonify(
         width=WIDTH,
         height=HEIGHT,
@@ -146,36 +184,49 @@ def board():
     )
 
 
-@app.post("/drop")
+@app.get("/drop")
 def drop():
-    """Drop a ball. Betting stays open until the ball passes the last row of pins."""
-    settle()  # in case the previous drop was never settled
+    """Drop a ball and stream it to the page as it falls.
+
+    The page gets a "frame" event 60 times a second with the ball's position right now,
+    then one "result" event when the ball lands. It never sees a position ahead of time.
+    """
+    settle()  # in case a ball landed while nobody was watching
+    if ball["path"] is not None:
+        return jsonify(error="A ball is already falling."), 409
     path, bucket = simulate_drop()
     close_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
-    ball["bucket"] = bucket
-    ball["betting_closes_at"] = time.time() + close_frame * STEPS_PER_FRAME * DT
+    ball.update(path=path, bucket=bucket, close_frame=close_frame, started_at=time.time())
 
-    # The counterparty bets one point at the drop and one more every 0.5 seconds until betting
-    # closes, each time on whichever half of the board the ball is in at that moment.
-    buys = []
-    ball["counterparty"] = {"left": 0, "right": 0}
-    for frame in range(0, close_frame, COUNTERPARTY_BUY_FRAMES):
-        side = "left" if path[frame][0] < WIDTH / 2 else "right"
-        buys.append((frame, side))
-        ball["counterparty"][side] += 1
-    return jsonify(path=path, close_frame=close_frame, counterparty_buys=buys)
+    def stream():
+        for frame, (x, y) in enumerate(path):
+            time.sleep(max(0, seconds_until(frame)))
+            yield sse("frame", {
+                "x": x,
+                "y": y,
+                "betting_open": frame < close_frame,
+                "theirs": counterparty_bets(path, min(frame + 1, close_frame)),
+            })
+        time.sleep(max(0, seconds_until(len(path))))
+        settle()
+        yield sse("result", state)
+
+    # The headers ask anything between the server and the browser not to hold events back.
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return Response(stream(), mimetype="text/event-stream", headers=headers)
 
 
 @app.post("/bet")
 def bet():
     """Change the bet on one side by one point. While a ball is falling, bets can only go up."""
+    settle()  # in case a ball landed while nobody was watching
     side, change = request.json["side"], request.json["change"]
     bets = state["bets"]
     if side not in ("left", "right") or change not in (1, -1):
         return jsonify(error="Bad bet."), 400
-    if ball["bucket"] is not None and change < 0:
+    if ball["path"] is not None and change < 0:
         return jsonify(error="Bets can't be lowered once the ball drops."), 400
-    if ball["bucket"] is not None and time.time() > ball["betting_closes_at"]:
+    if ball["path"] is not None and seconds_until(ball["close_frame"]) < 0:
         return jsonify(error="Betting is closed."), 400
     if bets[side] + change < 0:
         return jsonify(error="Bets can't be negative."), 400
@@ -185,13 +236,7 @@ def bet():
     return jsonify(state=state)
 
 
-@app.post("/settle")
-def settle_drop():
-    """Called by the page when the ball lands. Pays out and reveals the result."""
-    bucket, won = settle()
-    return jsonify(bucket=bucket, won=won, state=state)
-
-
 if __name__ == "__main__":
     # Render tells us which port to listen on through the PORT environment variable.
-    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    # Each falling ball holds one thread for the whole drop, so allow plenty.
+    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), threads=16)

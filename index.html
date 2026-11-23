@@ -52,7 +52,6 @@
     const ctx = canvas.getContext("2d");
     const button = document.getElementById("drop");
     const message = document.getElementById("message");
-    const FPS = 60;  // the server sends one ball position per 1/60 second
     let board;
     let myBets = { left: 0, right: 0 };
     let theirBets = { left: 0, right: 0 };
@@ -124,44 +123,47 @@
       };
     }
 
-    // Play back the path the server computed, showing each counterparty buy when the ball
-    // reaches its frame. Bets can still go up until the ball reaches closeFrame. When the
-    // ball lands, ask the server for the result.
-    function animate(path, closeFrame, counterpartyBuys) {
-      const start = performance.now();
-      async function frame(now) {
-        const i = Math.floor((now - start) / 1000 * FPS);
-        if (i < path.length) {
-          draw(path[i]);
-          while (counterpartyBuys.length > 0 && counterpartyBuys[0][0] <= i) {
-            theirBets[counterpartyBuys.shift()[1]] += 1;
-            showMarket();
-          }
-          if (i >= closeFrame) {
-            enableBetButtons(false, false);
-            message.textContent = "Betting closed";
-          }
-          requestAnimationFrame(frame);
-        } else {
-          draw(path[path.length - 1]);
-          const result = await post("/settle", {});
-          theirBets = { left: 0, right: 0 };
-          showState(result.state);
-          const sign = result.won > 0 ? "+" : "";
-          message.textContent = `Landed ${result.bucket}: ${sign}${result.won} points`;
-          enableBetButtons(true, true);
-          button.disabled = false;
-        }
-      }
-      requestAnimationFrame(frame);
+    // Called when a drop is over, to get ready for the next one.
+    function endDrop(text) {
+      message.textContent = text;
+      theirBets = { left: 0, right: 0 };
+      showMarket();
+      enableBetButtons(true, true);
+      button.disabled = false;
     }
 
-    button.onclick = async () => {
+    // Ask the server to drop a ball, and listen to the stream of events it sends back:
+    // a "frame" event for each new ball position, then one "result" event when it lands.
+    button.onclick = () => {
       button.disabled = true;
       enableBetButtons(false, true);
       message.textContent = "Betting is open: you can still add to your bets";
-      const result = await post("/drop", {});
-      animate(result.path, result.close_frame, result.counterparty_buys);
+      const stream = new EventSource("/drop");
+
+      stream.addEventListener("frame", (event) => {
+        const frame = JSON.parse(event.data);
+        draw([frame.x, frame.y]);
+        theirBets = frame.theirs;
+        showMarket();
+        if (!frame.betting_open) {
+          enableBetButtons(false, false);
+          message.textContent = "Betting closed";
+        }
+      });
+
+      stream.addEventListener("result", (event) => {
+        stream.close();
+        const state = JSON.parse(event.data);
+        const sign = state.last_won > 0 ? "+" : "";
+        endDrop(`Landed ${state.last_bucket}: ${sign}${state.last_won} points`);
+        showState(state);
+      });
+
+      // Without close(), the browser would reconnect and start another drop.
+      stream.onerror = () => {
+        stream.close();
+        endDrop("Couldn't follow the drop. Try again in a moment.");
+      };
     };
 
     async function init() {
