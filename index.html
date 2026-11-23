@@ -2,22 +2,29 @@
 <html>
 <head>
   <meta charset="utf-8">
+  <!-- Tells phones to lay the page out at their real width instead of a zoomed-out desktop width. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>bouncemarket</title>
   <style>
-    body { font-family: sans-serif; text-align: center; background: #111; color: #eee; }
-    canvas { background: #222; display: block; margin: 16px auto; }
-    #bets { display: flex; width: 400px; margin: 0 auto; }
+    body { font-family: sans-serif; text-align: center; background: #111; color: #eee; margin: 8px; }
+    p { margin: 8px 0; }
+    /* The board shrinks to fit a small screen, keeping its shape, and never takes more than
+       half the screen's height, so the bet buttons stay in view below it. */
+    canvas { background: #222; display: block; margin: 0 auto; max-width: 100%; max-height: 50dvh; }
+    #bets { display: flex; max-width: 400px; margin: 0 auto; }
     .side { flex: 1; }
     .side button {
       width: 56px; height: 56px; border: none; border-radius: 50%;
       font-size: 32px; font-weight: bold; color: #111; cursor: pointer;
+      touch-action: manipulation;  /* stops a quick double tap from zooming the page */
     }
     .side button:active { transform: scale(0.9); }
     .side button:disabled { opacity: 0.3; cursor: default; }
     .side .bet { display: inline-block; width: 48px; font-size: 28px; font-weight: bold; }
     #left-side button { background: #f9a8d4; }
     #right-side button { background: #93c5fd; }
-    #message { font-size: 20px; font-weight: bold; color: #fc3; }
+    /* Room for two lines, so the page doesn't jump when a long message wraps on a phone. */
+    #message { font-size: 18px; font-weight: bold; color: #fc3; min-height: 2.4em; }
   </style>
 </head>
 <body>
