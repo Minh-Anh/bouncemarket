@@ -34,6 +34,10 @@ You play against a counterparty with a simple strategy: it bets one point on whi
 
 There is no house. All bets, yours and the counterparty's, go into one pot, and when the ball lands the pot is split among the points bet on the winning bucket. So you can only win what the counterparty loses, a crowded side pays little per point, and an empty side pays a lot. The "Pays" number under each side is what one point on that side gets back if it wins, given the bets so far. If nobody bet on the winning bucket, everyone gets their bets back.
 
+## How it works
+
+The server simulates the whole drop the moment you click Drop, but keeps the result to itself. It streams the ball's position to the page 60 times a second (as [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)), so the page only ever knows where the ball is now, and learns the bucket when the ball lands.
+
 ## Tuning the physics
 
 Gravity and bounce can be passed on the command line:
