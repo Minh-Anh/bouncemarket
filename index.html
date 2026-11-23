@@ -13,7 +13,8 @@
       font-size: 32px; font-weight: bold; color: #111; cursor: pointer;
     }
     .side button:active { transform: scale(0.9); }
-    .side span { display: inline-block; width: 48px; font-size: 28px; font-weight: bold; }
+    .side button:disabled { opacity: 0.3; cursor: default; }
+    .side .bet { display: inline-block; width: 48px; font-size: 28px; font-weight: bold; }
     #left-side button { background: #f9a8d4; }
     #right-side button { background: #93c5fd; }
     #drop {
@@ -30,14 +31,16 @@
     <div class="side" id="left-side">
       <p>Bet on left</p>
       <button data-side="left" data-change="-1">&minus;</button>
-      <span id="bet-left">0</span>
+      <span class="bet" id="bet-left">0</span>
       <button data-side="left" data-change="1">+</button>
+      <p>Them: <span id="their-left">0</span> &nbsp; Pays: <span id="pays-left"></span></p>
     </div>
     <div class="side" id="right-side">
       <p>Bet on right</p>
       <button data-side="right" data-change="-1">&minus;</button>
-      <span id="bet-right">0</span>
+      <span class="bet" id="bet-right">0</span>
       <button data-side="right" data-change="1">+</button>
+      <p>Them: <span id="their-right">0</span> &nbsp; Pays: <span id="pays-right"></span></p>
     </div>
   </div>
   <button id="drop">Drop</button>
@@ -50,9 +53,9 @@
     const button = document.getElementById("drop");
     const message = document.getElementById("message");
     const FPS = 60;  // the server sends one ball position per 1/60 second
-    const bets = { left: 0, right: 0 };
-    let points = 0;
     let board;
+    let myBets = { left: 0, right: 0 };
+    let theirBets = { left: 0, right: 0 };
 
     function circle(x, y, r, color) {
       ctx.fillStyle = color;
@@ -73,46 +76,80 @@
       if (ball) circle(ball[0], ball[1], board.ball_r, "#fc3");
     }
 
-    function showBets() {
-      document.getElementById("bet-left").textContent = bets.left;
-      document.getElementById("bet-right").textContent = bets.right;
-    }
-
-    // Each plus/minus button changes one side's bet by one, if the new bets are allowed.
-    for (const betButton of document.querySelectorAll(".side button")) {
-      betButton.onclick = () => {
-        if (button.disabled) return;  // a ball is dropping
-        const side = betButton.dataset.side;
-        const change = Number(betButton.dataset.change);
-        if (bets[side] + change >= 0 && bets.left + bets.right + change <= points) {
-          bets[side] += change;
-          showBets();
-        }
-      };
+    // Show both players' bets, and what each point on a side gets back if that side wins:
+    // the whole pot divided by the points bet on that side.
+    function showMarket() {
+      const pot = myBets.left + myBets.right + theirBets.left + theirBets.right;
+      for (const side of ["left", "right"]) {
+        const onSide = myBets[side] + theirBets[side];
+        document.getElementById("bet-" + side).textContent = myBets[side];
+        document.getElementById("their-" + side).textContent = theirBets[side];
+        document.getElementById("pays-" + side).textContent = onSide ? "×" + (pot / onSide).toFixed(2) : "–";
+      }
     }
 
     function showState(state) {
-      points = state.points;
       document.getElementById("points").textContent = state.points;
       document.getElementById("left").textContent = state.left;
       document.getElementById("right").textContent = state.right;
+      myBets = state.bets;
+      showMarket();
     }
 
-    // Play back the path the server computed, then reveal the result.
-    function animate(result) {
+    async function post(url, data) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      return response.json();
+    }
+
+    // Turn the minus buttons and the plus buttons on or off.
+    function enableBetButtons(minus, plus) {
+      for (const betButton of document.querySelectorAll(".side button")) {
+        betButton.disabled = betButton.dataset.change === "1" ? !plus : !minus;
+      }
+    }
+
+    // Each plus/minus button asks the server to change one side's bet by one.
+    for (const betButton of document.querySelectorAll(".side button")) {
+      betButton.onclick = async () => {
+        const result = await post("/bet", {
+          side: betButton.dataset.side,
+          change: Number(betButton.dataset.change),
+        });
+        if (result.error) message.textContent = result.error;
+        else showState(result.state);
+      };
+    }
+
+    // Play back the path the server computed, showing each counterparty buy when the ball
+    // reaches its frame. Bets can still go up until the ball reaches closeFrame. When the
+    // ball lands, ask the server for the result.
+    function animate(path, closeFrame, counterpartyBuys) {
       const start = performance.now();
-      function frame(now) {
+      async function frame(now) {
         const i = Math.floor((now - start) / 1000 * FPS);
-        if (i < result.path.length) {
-          draw(result.path[i]);
+        if (i < path.length) {
+          draw(path[i]);
+          while (counterpartyBuys.length > 0 && counterpartyBuys[0][0] <= i) {
+            theirBets[counterpartyBuys.shift()[1]] += 1;
+            showMarket();
+          }
+          if (i >= closeFrame) {
+            enableBetButtons(false, false);
+            message.textContent = "Betting closed";
+          }
           requestAnimationFrame(frame);
         } else {
-          draw(result.path[result.path.length - 1]);
+          draw(path[path.length - 1]);
+          const result = await post("/settle", {});
+          theirBets = { left: 0, right: 0 };
           showState(result.state);
           const sign = result.won > 0 ? "+" : "";
           message.textContent = `Landed ${result.bucket}: ${sign}${result.won} points`;
-          bets.left = bets.right = 0;
-          showBets();
+          enableBetButtons(true, true);
           button.disabled = false;
         }
       }
@@ -120,19 +157,11 @@
     }
 
     button.onclick = async () => {
-      const response = await fetch("/drop", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(bets),
-      });
-      const result = await response.json();
-      if (!response.ok) {
-        message.textContent = result.error;
-        return;
-      }
-      message.innerHTML = "&nbsp;";
       button.disabled = true;
-      animate(result);
+      enableBetButtons(false, true);
+      message.textContent = "Betting is open: you can still add to your bets";
+      const result = await post("/drop", {});
+      animate(result.path, result.close_frame, result.counterparty_buys);
     };
 
     async function init() {

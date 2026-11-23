@@ -22,7 +22,13 @@ Then open http://localhost:8000.
 
 ## How to play
 
-You start with 10 points. Before each drop, bet any whole number of points on left, right, or both, as long as the bets add up to no more than your points. Each point bet on the bucket the ball lands in wins a point; each point bet on the other bucket loses a point.
+You start with 10 points. Use the plus and minus buttons to bet points on left, right, or both, as long as the bets add up to no more than your points.
+
+Betting stays open after the drop: while the ball is falling you can add to either bet (but not lower it) until the ball passes the last row of pins.
+
+You play against a counterparty with a simple strategy: it bets one point on whichever half of the board the ball starts in, then one more point every 0.5 seconds on whichever half the ball is in at that moment, until betting closes.
+
+There is no house. All bets, yours and the counterparty's, go into one pot, and when the ball lands the pot is split among the points bet on the winning bucket. So you can only win what the counterparty loses, a crowded side pays little per point, and an empty side pays a lot. The "Pays" number under each side is what one point on that side gets back if it wins, given the bets so far. If nobody bet on the winning bucket, everyone gets their bets back.
 
 ## Tuning the physics
 
