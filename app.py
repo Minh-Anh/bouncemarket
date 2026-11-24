@@ -23,6 +23,10 @@ BALL_R, PIN_R = 5, 3
 ROWS = 12  # must be even, so the last row has a center pin that caps the divider
 FIRST_ROW_Y, ROW_GAP = 120, 36
 LAST_ROW_Y = FIRST_ROW_Y + (ROWS - 1) * ROW_GAP
+# The side walls lean inwards, so the board is a trapezoid: WIDTH across the top, and
+# WALL_SLANT narrower on each side at the floor. The pins squeeze together as the walls close in.
+WALL_SLANT = 60
+WALL_LENGTH = math.hypot(WALL_SLANT, HEIGHT)
 
 # Physics. Gravity and bounce can be set on the command line, e.g. --bounce 0.3
 parser = argparse.ArgumentParser()
@@ -42,15 +46,25 @@ LEADERBOARD_SIZE = 10
 SEED_SHARES = 2  # pretend shares on each side, so the price starts at 0.50 and early buys move it gently
 
 
+def wall_inset(y):
+    """How far in from the canvas edge each side wall is at height y."""
+    return WALL_SLANT * y / HEIGHT
+
+
 def make_pins():
-    """Row 0 has 2 pins, and each row below has one more, so the board gets denser."""
+    """Row 0 has 2 pins, and each row below has one more, so the board gets denser.
+
+    Each row's pins are spaced evenly between the walls, with a full gap between the outermost
+    pin and the wall, so the ball can always fit past it instead of wedging against the wall.
+    """
     pins = []
     for row in range(ROWS):
         count = row + 2
-        spacing = WIDTH / count
         y = FIRST_ROW_Y + row * ROW_GAP
+        left = wall_inset(y)
+        spacing = (WIDTH - 2 * left) / (count + 1)
         for i in range(count):
-            pins.append((spacing * (i + 0.5), y))
+            pins.append((left + spacing * (i + 1), y))
     return pins
 
 
@@ -99,7 +113,8 @@ streams = {}  # {queue: player_id}
 
 def simulate_drop():
     """Drop one ball. Returns its position at every frame, and the bucket it lands in."""
-    x, y = random.uniform(BALL_R, WIDTH - BALL_R), 0.0
+    # Drop from somewhere in the middle two-thirds, so the ball never just slides down a slanted wall.
+    x, y = random.uniform(WIDTH / 6, WIDTH * 5 / 6), 0.0
     vx, vy = 0.0, 0.0
     path = []
     step = 0
@@ -112,11 +127,19 @@ def simulate_drop():
         x += vx * DT
         y += vy * DT
 
-        # Side walls.
-        if x < BALL_R:
-            x, vx = BALL_R, abs(vx) * BOUNCE
-        if x > WIDTH - BALL_R:
-            x, vx = WIDTH - BALL_R, -abs(vx) * BOUNCE
+        # Side walls. Each leans inwards, so each has its own normal: the direction pointing
+        # straight off the wall into the board, (nx, ny), mostly sideways and slightly up.
+        for nx, ny, distance in (
+            (HEIGHT / WALL_LENGTH, -WALL_SLANT / WALL_LENGTH, (x * HEIGHT - y * WALL_SLANT) / WALL_LENGTH),
+            (-HEIGHT / WALL_LENGTH, -WALL_SLANT / WALL_LENGTH, ((WIDTH - x) * HEIGHT - y * WALL_SLANT) / WALL_LENGTH),
+        ):
+            # distance is how far the ball's center is from the wall, measured along the normal.
+            if distance < BALL_R:
+                x, y = x + nx * (BALL_R - distance), y + ny * (BALL_R - distance)
+                speed_into_wall = -(vx * nx + vy * ny)
+                if speed_into_wall > 0:
+                    vx += (1 + BOUNCE) * speed_into_wall * nx
+                    vy += (1 + BOUNCE) * speed_into_wall * ny
 
         # Divider between the buckets: a wall from the last row's center pin to the floor.
         if y > LAST_ROW_Y and abs(x - WIDTH / 2) < BALL_R:
@@ -363,6 +386,8 @@ async def board(request):
         "pin_r": PIN_R,
         "last_row_y": LAST_ROW_Y,
         "pins": PINS,
+        "wall_slant": WALL_SLANT,
+        "countdown_seconds": COUNTDOWN_SECONDS,  # the page fades the landing highlight over this long
     })
 
 
