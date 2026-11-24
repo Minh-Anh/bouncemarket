@@ -18,6 +18,8 @@
       --right: #d95926;
     }
     * { box-sizing: border-box; }
+    /* Tapping quickly anywhere on the page doesn't zoom in. Pinching to zoom still works. */
+    html { touch-action: manipulation; }
     [hidden] { display: none !important; }  /* without this, a display rule below would un-hide a hidden element */
     body {
       margin: 0; background: var(--background); color: var(--text);
