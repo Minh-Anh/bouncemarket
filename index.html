@@ -99,12 +99,15 @@
     #leaderboard li { padding: 3px 0; text-transform: lowercase; }  /* names are stored as typed, shown in lowercase */
     #leaderboard .points { float: right; font-weight: bold; }
     #leaderboard .me { color: var(--accent); }
-    /* The small reset button just left of our own points: just the icon, in the row's yellow. */
-    #leaderboard .reset {
-      margin-right: 4px; padding: 2px; border: none; background: none; color: inherit;
+    /* The two small buttons on our own row, each just an icon in the row's yellow: a pencil
+       right after our name, to change it, and the reset button just left of our points. */
+    #leaderboard .reset, #leaderboard .rename {
+      padding: 2px; border: none; background: none; color: inherit;
       cursor: pointer; vertical-align: -2px; opacity: 0.7;
     }
-    #leaderboard .reset:hover { opacity: 1; }
+    #leaderboard .reset { margin-right: 4px; }
+    #leaderboard .rename { margin-left: 6px; }
+    #leaderboard .reset:hover, #leaderboard .rename:hover { opacity: 1; }
 
     /* The confirmation dialog for a reset. */
     dialog { max-width: 320px; border: none; border-radius: 12px; padding: 18px; background: var(--panel); color: var(--text); }
@@ -189,16 +192,27 @@
     </button>
   </template>
 
-  <!-- Opened from the "Claim name" button on a guest's own leaderboard row. -->
+  <!-- The pencil button shown after our own name on the leaderboard, to change it. -->
+  <template id="rename-icon">
+    <button class="rename" type="button" aria-label="change username" title="change username">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>
+      </svg>
+    </button>
+  </template>
+
+  <!-- Opened from the "set username" button on a guest's own leaderboard row, to pick a first
+       name, and from the pencil on a named player's row, to change it. openNameDialog() fills
+       in the heading, the explanation and the button to suit. -->
   <dialog id="claim-dialog">
-    <h2>set a username</h2>
-    <p>your username goes on the leaderboard, and your points are saved from then on. usernames can't be changed later.</p>
+    <h2 id="claim-title"></h2>
+    <p id="claim-text"></p>
     <form id="claim">
       <input id="name" maxlength="16" placeholder="your username" autocomplete="off">
       <p class="muted" id="claim-error"></p>
       <div class="dialog-buttons">
         <button type="button" id="claim-cancel">cancel</button>
-        <button id="claim-confirm">set username</button>
+        <button id="claim-confirm"></button>
       </div>
     </form>
   </dialog>
@@ -398,9 +412,17 @@
       }
     };
 
-    // The claim dialog: pick a name, which puts it on the leaderboard in place of "you".
+    // The name dialog: pick a name, which puts it on the leaderboard in place of "you", or change
+    // the name we have. Either way the server is asked the same thing: make this our name.
     const claimDialog = document.getElementById("claim-dialog");
-    function openClaimDialog() {
+    function openNameDialog() {
+      const changing = me.name !== null;
+      document.getElementById("claim-title").textContent = changing ? "change your username" : "set a username";
+      document.getElementById("claim-text").textContent = changing
+        ? "pick any username that nobody else is using. your points stay with you."
+        : "your username goes on the leaderboard, and your points are saved from then on. you can change it later.";
+      document.getElementById("claim-confirm").textContent = changing ? "change username" : "set username";
+      document.getElementById("name").value = changing ? me.name : "";  // start from the name we have
       document.getElementById("claim-error").textContent = "";
       claimDialog.showModal();
     }
@@ -442,10 +464,14 @@
             claim.type = "button";
             claim.className = "claim-button";
             claim.textContent = "set username";
-            claim.onclick = openClaimDialog;
+            claim.onclick = openNameDialog;
             row.append(claim);
           } else {
-            // With a name, a small reset button just left of the points, which asks before doing anything.
+            // With a name, a small pencil button after it, to change it.
+            const rename = document.getElementById("rename-icon").content.firstElementChild.cloneNode(true);
+            rename.onclick = openNameDialog;
+            row.append(rename);
+            // And a small reset button just left of the points, which asks before doing anything.
             const reset = document.getElementById("reset-icon").content.firstElementChild.cloneNode(true);
             reset.onclick = openResetDialog;
             points.prepend(reset);

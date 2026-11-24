@@ -146,6 +146,11 @@ player_keys = {}
 # Rounds waiting to be saved to the round log, oldest first, each as made by round_log().
 unsaved_rounds = []
 
+# Held while writing to the players table, so there is only ever one write on its way to the
+# database, made from the names as they are at that moment. Without it, a round's points sent
+# with a player's old name could arrive after their change of name, and undo it.
+saving_players = asyncio.Lock()
+
 
 def simulate_drop(start_x, gravity, bounce):
     """Drop one ball from start_x along the top. Returns its state at every frame, as
@@ -684,7 +689,10 @@ async def run_rounds():
         game["dropping"] = False
         game["drops_at"] = time.time() + COUNTDOWN_SECONDS
         try:
-            await save_players(rows)
+            async with saving_players:
+                for row in rows:
+                    row["name"] = players[row["id"]]["name"]  # they may have changed it since settle() made the row
+                await save_players(rows)
         except httpx.HTTPError as error:
             # The game carries on. These players' points are saved after the next round they play.
             print("Could not save points:", repr(error))
@@ -836,8 +844,9 @@ async def buy(request):
     return JSONResponse(player)
 
 
-async def claim_name(request):
-    """Give a player a name, which puts them on the leaderboard. Names are unique and permanent."""
+async def set_name(request):
+    """Give a player a name, which puts them on the leaderboard, or change the name they have
+    to any other that nobody is using. Names are unique, ignoring capitals."""
     data = await request.json()
     player_id = parse_id(data["player"])
     if player_id not in players:
@@ -849,20 +858,28 @@ async def claim_name(request):
     # Make sure we know whether this player already has a saved name before writing a new one.
     sorry = JSONResponse({"error": "couldn't save your username. try again in a minute."}, status_code=503)
     player = await get_player(player_id)
-    if player["name"]:
-        return JSONResponse(player)
     if not player["loaded"]:
         return sorry
+    if name == player["name"]:
+        return JSONResponse(player)
     try:
-        await save_players([{"id": player_id, "name": name, "points": player["points"]}])
+        async with saving_players:
+            old_name = player["name"]
+            if old_name:
+                # A change of name writes only the name. Their saved points stay as they are.
+                response = await db.patch("/players", params={"id": "eq." + player_id}, json={"name": name})
+                response.raise_for_status()
+            else:
+                await save_players([{"id": player_id, "name": name, "points": player["points"]}])
+            player["name"] = name
+            # On the leaderboard, the new name takes over the points shown beside the old one.
+            named_points[name] = named_points.pop(old_name, player["points"])
     except httpx.HTTPError as error:
         # The database answers 409 when someone else already has the name.
         if isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 409:
             return JSONResponse({"error": "sorry, that username is taken."}, status_code=409)
         print("Could not save a name:", repr(error))
         return sorry
-    player["name"] = name
-    named_points[name] = player["points"]
     publish_leaderboard()
     return JSONResponse(player)
 
@@ -883,7 +900,8 @@ async def reset_points(request):
     named_points[player["name"]] = 10
     publish_leaderboard()
     try:
-        await save_players([{"id": parse_id(data["player"]), "name": player["name"], "points": 10}])
+        async with saving_players:
+            await save_players([{"id": parse_id(data["player"]), "name": player["name"], "points": 10}])
     except httpx.HTTPError as error:
         # Like a round's save: these points are saved after the next round the player plays in.
         print("Could not save a reset:", repr(error))
@@ -908,7 +926,7 @@ app = Starlette(
         Route("/board", board),
         Route("/events", events),
         Route("/buy", buy, methods=["POST"]),
-        Route("/name", claim_name, methods=["POST"]),
+        Route("/name", set_name, methods=["POST"]),
         Route("/reset", reset_points, methods=["POST"]),
     ],
     lifespan=lifespan,
