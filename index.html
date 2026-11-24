@@ -25,6 +25,11 @@
     #right-side button { background: #93c5fd; }
     /* Room for two lines, so the page doesn't jump when a long message wraps on a phone. */
     #message { font-size: 18px; font-weight: bold; color: #fc3; min-height: 2.4em; }
+    #name, #claim button { font-size: 16px; padding: 6px 10px; border-radius: 8px; border: none; }
+    #name { width: 11em; }
+    #claim button { background: #fc3; color: #111; font-weight: bold; cursor: pointer; }
+    #leaderboard { display: inline-block; text-align: left; margin: 0; }
+    #leaderboard .me { color: #fc3; font-weight: bold; }
   </style>
 </head>
 <body>
@@ -47,6 +52,16 @@
   <p>Landed left: <span id="left"></span> &nbsp;|&nbsp; Landed right: <span id="right"></span></p>
   <p>Players online: <span id="online"></span></p>
 
+  <!-- Shown until this player has claimed a name. -->
+  <form id="claim" hidden>
+    <input id="name" maxlength="16" placeholder="Your name" autocomplete="off">
+    <button>Join the leaderboard</button>
+    <p id="claim-error"></p>
+  </form>
+  <p id="playing-as" hidden>Playing as <b id="my-name"></b></p>
+  <h3>Leaderboard</h3>
+  <ol id="leaderboard"></ol>
+
   <script>
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
@@ -54,7 +69,8 @@
     const FPS = 60;  // the ball moves one frame every 1/60 second
     let board;
     let game = null;  // the latest public message: the state of the shared game
-    let me = null;  // the latest private message: this player's points and shares
+    let me = null;  // the latest private message: this player's name, points and shares
+    let leaderboard = [];  // the latest leaderboard message: the top players' names and points
     let queue = [];  // ball positions waiting until their frame is due, each [frame, x, y]
     let dropStart = null;  // on our clock, the moment the ball dropped
 
@@ -92,6 +108,11 @@
       document.getElementById("right").textContent = game.landed.right;
       document.getElementById("online").textContent = game.online;
 
+      // Offer the name form until we have a name, then show the name instead.
+      document.getElementById("claim").hidden = me.name !== null;
+      document.getElementById("playing-as").hidden = me.name === null;
+      document.getElementById("my-name").textContent = me.name;
+
       // A share can be bought while betting is open, if we can afford its price.
       for (const buyButton of document.querySelectorAll(".side button")) {
         const side = buyButton.dataset.side;
@@ -102,7 +123,7 @@
       }
 
       if (game.dropping) {
-        message.textContent = game.betting_open ? "Betting is open: you can still buy" : "Betting closed";
+        message.textContent = game.betting_open ? "Betting is open" : "Betting closed";
       } else {
         let text = `Next drop in ${Math.ceil(game.seconds_to_drop)}`;
         if (game.last_bucket) {
@@ -127,6 +148,34 @@
           render();
         }
       };
+    }
+
+    // Claim a name, which puts us on the leaderboard.
+    document.getElementById("claim").onsubmit = async (event) => {
+      event.preventDefault();  // stop the browser reloading the page, its default for forms
+      const response = await fetch("/name", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ player: playerId, name: document.getElementById("name").value }),
+      });
+      const result = await response.json();
+      if (response.ok) {
+        me = result;
+        render();
+        showLeaderboard();  // to highlight our new name
+      } else {
+        document.getElementById("claim-error").textContent = result.error;
+      }
+    };
+
+    function showLeaderboard() {
+      const rows = leaderboard.map((entry) => {
+        const row = document.createElement("li");
+        row.textContent = `${entry.name}: ${entry.points}`;
+        if (me && entry.name === me.name) row.className = "me";
+        return row;
+      });
+      document.getElementById("leaderboard").replaceChildren(...rows);
     }
 
     // The public "game" message arrives 10 times a second. While the ball is falling, each
@@ -164,10 +213,11 @@
       canvas.height = board.height;
       draw(null);
       // The server sends a stream of messages for as long as the page is open: a private
-      // "me" message with our points and shares, and the public "game" message.
+      // "me" message with our name, points and shares, the public "game" message, and the leaderboard.
       // If the connection drops, the browser reconnects by itself.
       const stream = new EventSource("/events?player=" + playerId);
-      stream.addEventListener("me", (event) => { me = JSON.parse(event.data); render(); });
+      stream.addEventListener("me", (event) => { me = JSON.parse(event.data); render(); showLeaderboard(); });
+      stream.addEventListener("leaderboard", (event) => { leaderboard = JSON.parse(event.data); showLeaderboard(); });
       stream.addEventListener("game", (event) => receiveGame(JSON.parse(event.data)));
       requestAnimationFrame(play);
     }

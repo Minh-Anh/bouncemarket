@@ -1,5 +1,5 @@
 # /// script
-# dependencies = ["starlette", "uvicorn"]  # keep in sync with requirements.txt
+# dependencies = ["httpx", "starlette", "uvicorn"]  # keep in sync with requirements.txt
 # ///
 import argparse
 import asyncio
@@ -9,7 +9,9 @@ import math
 import os
 import random
 import time
+import uuid
 
+import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse, StreamingResponse
@@ -36,6 +38,7 @@ BROADCASTS_PER_SECOND = 10  # how often every page is sent the state of the game
 BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the page can play back smoothly
 COUNTERPARTY_BUY_FRAMES = 30  # the counterparty buys every 30 frames, which is 0.5 seconds
 COUNTDOWN_SECONDS = 5  # the wait between one ball landing and the next one dropping
+LEADERBOARD_SIZE = 10
 SEED_SHARES = 2  # pretend shares on each side, so the price starts at 0.50 and early buys move it gently
 
 
@@ -53,7 +56,16 @@ def make_pins():
 
 PINS = make_pins()
 
-# Everything below lives in memory for now, so it resets when the server restarts.
+# Named players are kept in a Supabase database table, so their points survive a restart.
+# We talk to it over its web API. The secret key gives full access, so it stays on the
+# server (in an environment variable) and the page never talks to Supabase itself.
+db = httpx.AsyncClient(
+    base_url=os.environ["SUPABASE_URL"] + "/rest/v1",
+    headers={"apikey": os.environ["SUPABASE_KEY"], "Authorization": "Bearer " + os.environ["SUPABASE_KEY"]},
+    timeout=10,
+)
+
+# Everything below lives in memory, so it resets when the server restarts.
 # The whole server runs on one thread (see the bottom of the file), so none of it needs locks.
 
 # The one shared game that every player watches and bets on. Rounds repeat forever:
@@ -71,11 +83,14 @@ game = {
     "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
     "last_bucket": None,  # where the previous ball landed
     "landed": {"left": 0, "right": 0},  # how many balls have landed in each bucket
+    "leaderboard": [],  # the named players with the most points, as [{"name": ..., "points": ...}]
 }
 
-# One entry per player, keyed by the random id their browser sends:
-# {"points": 10, "shares": {"left": 0, "right": 0}, "spent": 0, "last_won": 0}
-# "shares" and "spent" are what the player has bought, and paid for it, in the current round.
+# One entry per player who has opened the page since the server started, keyed by the
+# random id their browser sends:
+# {"name": None, "points": 10, "shares": {"left": 0, "right": 0}, "spent": 0, "last_won": 0, "loaded": True}
+# "name" is None until the player claims one. "shares" and "spent" are what the player has
+# bought, and paid for it, in the current round. "loaded" is explained in get_player().
 players = {}
 
 # One entry per open page: a queue of messages waiting to be sent to it, and whose page it is.
@@ -127,16 +142,81 @@ def simulate_drop():
     return path, bucket
 
 
-def get_player(player_id):
-    """Look up a player, creating them with 10 points the first time we see their id."""
+def parse_id(text):
+    """Player ids are UUIDs, the random ids browsers make. Returns None for anything else."""
+    try:
+        return str(uuid.UUID(text))
+    except ValueError:
+        return None
+
+
+async def load_player(player_id):
+    """Fetch a named player's row from the database, or None if this id never claimed a name."""
+    response = await db.get("/players", params={"id": "eq." + player_id, "select": "name,points"})
+    response.raise_for_status()
+    rows = response.json()
+    return rows[0] if rows else None
+
+
+async def save_players(rows):
+    """Write rows of {"id", "name", "points"} to the database, replacing any with the same id."""
+    if rows:
+        response = await db.post("/players", json=rows, headers={"Prefer": "resolution=merge-duplicates"})
+        response.raise_for_status()
+
+
+async def refresh_leaderboard():
+    """Fetch the top named players from the database and send the list to every page."""
+    params = {"select": "name,points", "order": "points.desc", "limit": LEADERBOARD_SIZE}
+    try:
+        response = await db.get("/players", params=params)
+        response.raise_for_status()
+    except httpx.HTTPError as error:
+        print("Could not load the leaderboard:", repr(error))  # keep showing the last one we got
+        return
+    game["leaderboard"] = response.json()
+    for queue in streams:
+        send(queue, sse("leaderboard", game["leaderboard"]))
+
+
+async def get_player(player_id):
+    """Look up a player, creating them with 10 points the first time we see their id.
+
+    If they claimed a name before, the database has their name and points, and we load those.
+    If the database can't be reached they can still play, without a name for now, and we
+    look again the next time they connect. "loaded" records whether that lookup has worked.
+    """
     if player_id not in players:
-        players[player_id] = {"points": 10, "shares": {"left": 0, "right": 0}, "spent": 0, "last_won": 0}
-    return players[player_id]
+        players[player_id] = {
+            "name": None,
+            "points": 10,
+            "shares": {"left": 0, "right": 0},
+            "spent": 0,
+            "last_won": 0,
+            "loaded": False,
+        }
+    player = players[player_id]
+    if not player["loaded"]:
+        try:
+            saved = await load_player(player_id)
+        except httpx.HTTPError as error:
+            print("Could not load a player:", repr(error))
+            return player
+        if not player["loaded"]:  # another request for the same player may have finished first
+            player["loaded"] = True
+            if saved:
+                player["name"], player["points"] = saved["name"], saved["points"]
+    return player
 
 
 def current_frame():
     """How many frames have passed since the ball dropped."""
     return int((time.time() - game["started_at"]) / FRAME_SECONDS)
+
+
+def betting_open():
+    """Shares can be bought from the moment the ball drops until it reaches close_frame."""
+    return game["dropping"] and current_frame() < game["close_frame"]
 
 
 def counterparty_shares():
@@ -186,10 +266,14 @@ def settle():
 
     Players paid for their shares when they bought them. The counterparty is on the other
     side of every share: it kept what players paid, and it pays out the winners.
+    Returns the database rows that need saving: the named players who played this round.
     """
     bucket = game["bucket"]
-    for player in players.values():
+    rows = []
+    for player_id, player in players.items():
         payout = player["shares"][bucket]
+        if player["name"] and player["spent"] > 0:
+            rows.append({"id": player_id, "name": player["name"], "points": round(player["points"] + payout, 2)})
         player["last_won"] = round(payout - player["spent"], 2)
         player["points"] = round(player["points"] + payout, 2)
         player["shares"] = {"left": 0, "right": 0}
@@ -200,12 +284,13 @@ def settle():
     game["landed"][bucket] += 1
     for queue, player_id in streams.items():
         send(queue, sse("me", players[player_id]))
+    return rows
 
 
 async def run_rounds():
     """The round loop: wait for the countdown, drop a ball, wait for it to land, pay out. Forever."""
     while True:
-        await asyncio.sleep(COUNTDOWN_SECONDS)
+        await asyncio.sleep(max(0, game["drops_at"] - time.time()))
         path, bucket = simulate_drop()
         last_row_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
         game.update(
@@ -219,9 +304,15 @@ async def run_rounds():
             sent_frames=0,
         )
         await asyncio.sleep(len(path) * FRAME_SECONDS)
-        settle()
+        rows = settle()
         game["dropping"] = False
         game["drops_at"] = time.time() + COUNTDOWN_SECONDS
+        try:
+            await save_players(rows)
+        except httpx.HTTPError as error:
+            # The game carries on. These players' points are saved after the next round they play.
+            print("Could not save points:", repr(error))
+        await refresh_leaderboard()
 
 
 async def broadcast():
@@ -239,7 +330,7 @@ async def broadcast():
             "dropping": game["dropping"],
             "seconds_to_drop": max(0, game["drops_at"] - time.time()),
             "prices": prices(),
-            "betting_open": not game["dropping"] or current_frame() < game["close_frame"],
+            "betting_open": betting_open(),
             "online": len(streams),
             "last_bucket": game["last_bucket"],
             "landed": game["landed"],
@@ -278,17 +369,21 @@ async def board(request):
 async def events(request):
     """Stream messages to one player's page for as long as it stays open.
 
-    The page gets a private "me" message (its points and shares) when it connects and after
-    each round, and the public "game" message from broadcast().
+    The page gets a private "me" message (its name, points and shares) when it connects and
+    after each round, the public "game" message from broadcast(), and a "leaderboard"
+    message when it connects and whenever the leaderboard is refreshed.
     """
-    player_id = request.query_params["player"][:64]
-    player = get_player(player_id)
+    player_id = parse_id(request.query_params["player"])
+    if player_id is None:
+        return JSONResponse({"error": "Bad player id."}, status_code=400)
+    player = await get_player(player_id)
 
     async def stream():
         queue = asyncio.Queue(maxsize=100)
         streams[queue] = player_id
         try:
             yield sse("me", player)
+            yield sse("leaderboard", game["leaderboard"])
             while True:
                 yield await queue.get()
         finally:
@@ -305,8 +400,10 @@ async def buy(request):
     side = data["side"]
     if side not in ("left", "right"):
         return JSONResponse({"error": "Bad side."}, status_code=400)
-    player = get_player(data["player"][:64])
-    if game["dropping"] and current_frame() >= game["close_frame"]:
+    player = players.get(parse_id(data["player"]))
+    if player is None:
+        return JSONResponse({"error": "Unknown player."}, status_code=400)
+    if not betting_open():
         return JSONResponse({"error": "Betting is closed."}, status_code=400)
     price = prices()[side]
     if price > player["points"]:
@@ -318,9 +415,40 @@ async def buy(request):
     return JSONResponse(player)
 
 
+async def claim_name(request):
+    """Give a player a name, which puts them on the leaderboard. Names are unique and permanent."""
+    data = await request.json()
+    player_id = parse_id(data["player"])
+    if player_id not in players:
+        return JSONResponse({"error": "Unknown player."}, status_code=400)
+    name = data["name"].strip()
+    if not 1 <= len(name) <= 16 or not name.isprintable():
+        return JSONResponse({"error": "Names must be 1 to 16 characters."}, status_code=400)
+
+    # Make sure we know whether this player already has a saved name before writing a new one.
+    sorry = JSONResponse({"error": "Couldn't save your name. Try again in a minute."}, status_code=503)
+    player = await get_player(player_id)
+    if player["name"]:
+        return JSONResponse(player)
+    if not player["loaded"]:
+        return sorry
+    try:
+        await save_players([{"id": player_id, "name": name, "points": player["points"]}])
+    except httpx.HTTPError as error:
+        # The database answers 409 when someone else already has the name.
+        if isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 409:
+            return JSONResponse({"error": "That name is taken."}, status_code=409)
+        print("Could not save a name:", repr(error))
+        return sorry
+    player["name"] = name
+    await refresh_leaderboard()
+    return JSONResponse(player)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
-    """Start the round loop and the broadcaster when the server starts."""
+    """Load the leaderboard, then start the round loop and the broadcaster, when the server starts."""
+    await refresh_leaderboard()
     tasks = [asyncio.create_task(run_rounds()), asyncio.create_task(broadcast())]
     yield
     for task in tasks:
@@ -333,6 +461,7 @@ app = Starlette(
         Route("/board", board),
         Route("/events", events),
         Route("/buy", buy, methods=["POST"]),
+        Route("/name", claim_name, methods=["POST"]),
     ],
     lifespan=lifespan,
 )
