@@ -36,6 +36,7 @@ BROADCASTS_PER_SECOND = 10  # how often every page is sent the state of the game
 BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the page can play back smoothly
 COUNTERPARTY_BUY_FRAMES = 30  # the counterparty buys every 30 frames, which is 0.5 seconds
 COUNTDOWN_SECONDS = 5  # the wait between one ball landing and the next one dropping
+SEED_SHARES = 2  # pretend shares on each side, so the price starts at 0.50 and early buys move it gently
 
 
 def make_pins():
@@ -67,13 +68,14 @@ game = {
     "bucket": None,
     "close_frame": 0,  # betting closes when the ball reaches this frame
     "sent_frames": 0,  # how many frames of the path have been sent to the pages so far
-    "bets": {"left": 0, "right": 0},  # all the players' bets on this round, added up
+    "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
     "last_bucket": None,  # where the previous ball landed
     "landed": {"left": 0, "right": 0},  # how many balls have landed in each bucket
 }
 
 # One entry per player, keyed by the random id their browser sends:
-# {"points": 10, "bets": {"left": 0, "right": 0}, "last_won": 0}
+# {"points": 10, "shares": {"left": 0, "right": 0}, "spent": 0, "last_won": 0}
+# "shares" and "spent" are what the player has bought, and paid for it, in the current round.
 players = {}
 
 # One entry per open page: a queue of messages waiting to be sent to it, and whose page it is.
@@ -128,7 +130,7 @@ def simulate_drop():
 def get_player(player_id):
     """Look up a player, creating them with 10 points the first time we see their id."""
     if player_id not in players:
-        players[player_id] = {"points": 10, "bets": {"left": 0, "right": 0}, "last_won": 0}
+        players[player_id] = {"points": 10, "shares": {"left": 0, "right": 0}, "spent": 0, "last_won": 0}
     return players[player_id]
 
 
@@ -137,17 +139,35 @@ def current_frame():
     return int((time.time() - game["started_at"]) / FRAME_SECONDS)
 
 
-def counterparty_bets(path, frames):
-    """How much the counterparty has bet on each bucket once the given number of frames have passed.
+def counterparty_shares():
+    """How many shares the counterparty has bought on each side so far this round.
 
-    It bets one point at the drop and one more every 0.5 seconds, each time on whichever
-    half of the board the ball is in at that moment.
+    It buys one share at the drop and one more every 0.5 seconds until betting closes, each
+    time on whichever half of the board the ball is in at that moment. It never collects on
+    them. They only move the price, towards the side the ball has been spending its time on.
     """
-    bets = {"left": 0, "right": 0}
-    for frame in range(0, frames, COUNTERPARTY_BUY_FRAMES):
-        side = "left" if path[frame][0] < WIDTH / 2 else "right"
-        bets[side] += 1
-    return bets
+    shares = {"left": 0, "right": 0}
+    if game["dropping"]:
+        frames = min(current_frame() + 1, game["close_frame"])
+        for frame in range(0, frames, COUNTERPARTY_BUY_FRAMES):
+            side = "left" if game["path"][frame][0] < WIDTH / 2 else "right"
+            shares[side] += 1
+    return shares
+
+
+def prices():
+    """What one share on each side costs right now. A share pays 1 point if its side wins.
+
+    The price of a side is its fraction of all the shares bought this round, by players and
+    by the counterparty. So a side that everyone is buying gets expensive, and the two
+    prices always add up to 1.
+    """
+    theirs = counterparty_shares()
+    left = game["shares"]["left"] + theirs["left"] + SEED_SHARES
+    right = game["shares"]["right"] + theirs["right"] + SEED_SHARES
+    left_price = round(left / (left + right), 2)
+    left_price = min(0.99, max(0.01, left_price))  # never free, and never a sure loss
+    return {"left": left_price, "right": round(1 - left_price, 2)}
 
 
 def sse(event, data):
@@ -162,27 +182,20 @@ def send(queue, message):
 
 
 def settle():
-    """Pay out every player's bets on the ball that just landed, and tell each page its result.
+    """Pay 1 point for every share on the bucket the ball landed in, and tell each page its result.
 
-    All bets, the players' and the counterparty's, go into one pot. The pot is split among
-    the points bet on the winning bucket, so players can only win what others lose.
+    Players paid for their shares when they bought them. The counterparty is on the other
+    side of every share: it kept what players paid, and it pays out the winners.
     """
     bucket = game["bucket"]
-    theirs = counterparty_bets(game["path"], game["close_frame"])
-    pot = theirs["left"] + theirs["right"] + game["bets"]["left"] + game["bets"]["right"]
-    winning_points = theirs[bucket] + game["bets"][bucket]
-
     for player in players.values():
-        my_total = player["bets"]["left"] + player["bets"]["right"]
-        if winning_points == 0:
-            payout = my_total  # nobody bet on the winning bucket, so everyone gets their bet back
-        else:
-            payout = pot * player["bets"][bucket] / winning_points
-        player["last_won"] = round(payout - my_total, 2)
-        player["points"] = round(player["points"] + player["last_won"], 2)
-        player["bets"] = {"left": 0, "right": 0}
+        payout = player["shares"][bucket]
+        player["last_won"] = round(payout - player["spent"], 2)
+        player["points"] = round(player["points"] + payout, 2)
+        player["shares"] = {"left": 0, "right": 0}
+        player["spent"] = 0
 
-    game["bets"] = {"left": 0, "right": 0}
+    game["shares"] = {"left": 0, "right": 0}
     game["last_bucket"] = bucket
     game["landed"][bucket] += 1
     for queue, player_id in streams.items():
@@ -225,17 +238,14 @@ async def broadcast():
         message = {
             "dropping": game["dropping"],
             "seconds_to_drop": max(0, game["drops_at"] - time.time()),
-            "totals": dict(game["bets"]),  # every bet on each side; the counterparty's are added below
+            "prices": prices(),
+            "betting_open": not game["dropping"] or current_frame() < game["close_frame"],
             "online": len(streams),
             "last_bucket": game["last_bucket"],
             "landed": game["landed"],
         }
         if game["dropping"]:
             frame = current_frame()
-            theirs = counterparty_bets(path, min(frame + 1, game["close_frame"]))
-            message["totals"]["left"] += theirs["left"]
-            message["totals"]["right"] += theirs["right"]
-            message["betting_open"] = frame < game["close_frame"]
             # The positions the pages don't have yet, and the frame number of the first of them.
             end = min(frame + BUFFER_FRAMES + 1, len(path))
             message["frame"] = frame
@@ -243,7 +253,6 @@ async def broadcast():
             message["positions"] = path[game["sent_frames"]:end]
             game["sent_frames"] = end
         else:
-            message["betting_open"] = True
             message["ball"] = path[-1] if path else None  # between drops the ball rests where it landed
 
         text = sse("game", message)
@@ -269,7 +278,7 @@ async def board(request):
 async def events(request):
     """Stream messages to one player's page for as long as it stays open.
 
-    The page gets a private "me" message (its points and bets) when it connects and after
+    The page gets a private "me" message (its points and shares) when it connects and after
     each round, and the public "game" message from broadcast().
     """
     player_id = request.query_params["player"][:64]
@@ -290,24 +299,22 @@ async def events(request):
     return StreamingResponse(stream(), media_type="text/event-stream", headers=headers)
 
 
-async def bet(request):
-    """Change a player's bet on one side by one point. While the ball is falling, bets can only go up."""
+async def buy(request):
+    """Buy one share on one side, at the current price."""
     data = await request.json()
-    side, change = data["side"], data["change"]
-    if side not in ("left", "right") or change not in (1, -1):
-        return JSONResponse({"error": "Bad bet."}, status_code=400)
+    side = data["side"]
+    if side not in ("left", "right"):
+        return JSONResponse({"error": "Bad side."}, status_code=400)
     player = get_player(data["player"][:64])
-    bets = player["bets"]
-    if game["dropping"] and change < 0:
-        return JSONResponse({"error": "Bets can't be lowered once the ball drops."}, status_code=400)
     if game["dropping"] and current_frame() >= game["close_frame"]:
         return JSONResponse({"error": "Betting is closed."}, status_code=400)
-    if bets[side] + change < 0:
-        return JSONResponse({"error": "Bets can't be negative."}, status_code=400)
-    if bets["left"] + bets["right"] + change > player["points"]:
-        return JSONResponse({"error": "You can't bet more than your points."}, status_code=400)
-    bets[side] += change
-    game["bets"][side] += change
+    price = prices()[side]
+    if price > player["points"]:
+        return JSONResponse({"error": "You don't have enough points."}, status_code=400)
+    player["points"] = round(player["points"] - price, 2)
+    player["spent"] = round(player["spent"] + price, 2)
+    player["shares"][side] += 1
+    game["shares"][side] += 1
     return JSONResponse(player)
 
 
@@ -325,7 +332,7 @@ app = Starlette(
         Route("/", index),
         Route("/board", board),
         Route("/events", events),
-        Route("/bet", bet, methods=["POST"]),
+        Route("/buy", buy, methods=["POST"]),
     ],
     lifespan=lifespan,
 )

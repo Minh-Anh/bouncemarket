@@ -20,7 +20,7 @@
     }
     .side button:active { transform: scale(0.9); }
     .side button:disabled { opacity: 0.3; cursor: default; }
-    .side .bet { display: inline-block; width: 48px; font-size: 28px; font-weight: bold; }
+    .side .price { font-size: 22px; font-weight: bold; }
     #left-side button { background: #f9a8d4; }
     #right-side button { background: #93c5fd; }
     /* Room for two lines, so the page doesn't jump when a long message wraps on a phone. */
@@ -33,20 +33,17 @@
   <p>Points: <span id="points"></span></p>
   <div id="bets">
     <div class="side" id="left-side">
-      <p>Bet on left</p>
-      <button data-side="left" data-change="-1">&minus;</button>
-      <span class="bet" id="bet-left">0</span>
-      <button data-side="left" data-change="1">+</button>
-      <p>Others: <span id="others-left">0</span> &nbsp; Pays: <span id="pays-left"></span></p>
+      <p>Left share: <span class="price" id="price-left"></span></p>
+      <button data-side="left">+</button>
+      <p>You hold <span id="shares-left">0</span></p>
     </div>
     <div class="side" id="right-side">
-      <p>Bet on right</p>
-      <button data-side="right" data-change="-1">&minus;</button>
-      <span class="bet" id="bet-right">0</span>
-      <button data-side="right" data-change="1">+</button>
-      <p>Others: <span id="others-right">0</span> &nbsp; Pays: <span id="pays-right"></span></p>
+      <p>Right share: <span class="price" id="price-right"></span></p>
+      <button data-side="right">+</button>
+      <p>You hold <span id="shares-right">0</span></p>
     </div>
   </div>
+  <p>Each share pays 1 point if the ball lands on its side.</p>
   <p>Landed left: <span id="left"></span> &nbsp;|&nbsp; Landed right: <span id="right"></span></p>
   <p>Players online: <span id="online"></span></p>
 
@@ -57,7 +54,7 @@
     const FPS = 60;  // the ball moves one frame every 1/60 second
     let board;
     let game = null;  // the latest public message: the state of the shared game
-    let me = null;  // the latest private message: this player's points and bets
+    let me = null;  // the latest private message: this player's points and shares
     let queue = [];  // ball positions waiting until their frame is due, each [frame, x, y]
     let dropStart = null;  // on our clock, the moment the ball dropped
 
@@ -95,30 +92,17 @@
       document.getElementById("right").textContent = game.landed.right;
       document.getElementById("online").textContent = game.online;
 
-      // game.totals is everyone's bets on each side, ours included. What each point on a side
-      // gets back if that side wins is the whole pot divided by the points bet on that side.
-      const mine = me.bets;
-      const myTotal = mine.left + mine.right;
-      const pot = game.totals.left + game.totals.right;
-      for (const side of ["left", "right"]) {
-        const onSide = game.totals[side];
-        document.getElementById("bet-" + side).textContent = mine[side];
-        // Our own bet can be a moment newer than the totals, so don't let this dip below zero.
-        document.getElementById("others-" + side).textContent = Math.max(0, onSide - mine[side]);
-        document.getElementById("pays-" + side).textContent = onSide ? "×" + (pot / onSide).toFixed(2) : "–";
-      }
-
-      // Bets can go up while betting is open, and down only before the ball drops.
-      for (const betButton of document.querySelectorAll(".side button")) {
-        if (betButton.dataset.change === "1") {
-          betButton.disabled = !game.betting_open || myTotal + 1 > me.points;
-        } else {
-          betButton.disabled = game.dropping || mine[betButton.dataset.side] === 0;
-        }
+      // A share can be bought while betting is open, if we can afford its price.
+      for (const buyButton of document.querySelectorAll(".side button")) {
+        const side = buyButton.dataset.side;
+        const price = game.prices[side];
+        document.getElementById("price-" + side).textContent = price.toFixed(2);
+        document.getElementById("shares-" + side).textContent = me.shares[side];
+        buyButton.disabled = !game.betting_open || price > me.points;
       }
 
       if (game.dropping) {
-        message.textContent = game.betting_open ? "Betting is open: you can still add to your bets" : "Betting closed";
+        message.textContent = game.betting_open ? "Betting is open: you can still buy" : "Betting closed";
       } else {
         let text = `Next drop in ${Math.ceil(game.seconds_to_drop)}`;
         if (game.last_bucket) {
@@ -129,18 +113,14 @@
       }
     }
 
-    // Each plus/minus button asks the server to change one side's bet by one.
-    // The server answers with our new points and bets.
-    for (const betButton of document.querySelectorAll(".side button")) {
-      betButton.onclick = async () => {
-        const response = await fetch("/bet", {
+    // Each plus button asks the server to buy one share on its side at the current price.
+    // The server answers with our new points and shares.
+    for (const buyButton of document.querySelectorAll(".side button")) {
+      buyButton.onclick = async () => {
+        const response = await fetch("/buy", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            player: playerId,
-            side: betButton.dataset.side,
-            change: Number(betButton.dataset.change),
-          }),
+          body: JSON.stringify({ player: playerId, side: buyButton.dataset.side }),
         });
         if (response.ok) {
           me = await response.json();
@@ -184,7 +164,7 @@
       canvas.height = board.height;
       draw(null);
       // The server sends a stream of messages for as long as the page is open: a private
-      // "me" message with our points and bets, and the public "game" message.
+      // "me" message with our points and shares, and the public "game" message.
       // If the connection drops, the browser reconnects by itself.
       const stream = new EventSource("/events?player=" + playerId);
       stream.addEventListener("me", (event) => { me = JSON.parse(event.data); render(); });

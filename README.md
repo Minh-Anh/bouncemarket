@@ -28,15 +28,15 @@ The app is hosted on [Render](https://render.com), which reads `render.yaml`, in
 
 ## How to play
 
-Everyone who opens the page watches the same ball and bets into the same market. A new ball drops 5 seconds after the last one lands.
+Everyone who opens the page watches the same ball and trades in the same market. A new ball drops 5 seconds after the last one lands.
 
-You start with 10 points. Use the plus and minus buttons to bet points on left, right, or both, as long as the bets add up to no more than your points.
+You start with 10 points. Each plus button buys one share on that side at the price shown. A share pays 1 point if the ball lands on its side and nothing if it doesn't. So a share bought at 0.30 makes 0.70 if it wins and loses 0.30 if it doesn't.
 
-Betting stays open after the drop: while the ball is falling you can add to either bet (but not lower it) until just before the ball passes the last row of pins.
+You can buy during the countdown and while the ball is falling, until just before it passes the last row of pins. Shares can't be sold back; you hold them until the ball lands.
 
-Besides the other players, there is a counterparty with a simple strategy: it bets one point on whichever half of the board the ball starts in, then one more point every 0.5 seconds on whichever half the ball is in at that moment, until betting closes. "Others" under each side is the total bet there by the counterparty and every other player.
+The price of a side is its fraction of all the shares bought this round, starting at 0.50 each, so the two prices always add up to 1. Every buy pushes that side's price up and the other side's down. Being right early, while a side is still cheap, pays more than piling in once everyone agrees.
 
-There is no house. All bets go into one pot, and when the ball lands the pot is split among the points bet on the winning bucket. So you can only win what others lose, a crowded side pays little per point, and an empty side pays a lot. The "Pays" number under each side is what one point on that side gets back if it wins, given the bets so far. If nobody bet on the winning bucket, everyone gets their bets back.
+There is also a counterparty with a simple strategy: it buys one share on whichever half of the board the ball starts in, then one more every 0.5 seconds on whichever half the ball is in at that moment, until betting closes. Its buying drifts the price towards the side the ball has been spending its time on. The counterparty is also the seller of every share you buy: it keeps what you pay and pays out the winners.
 
 ## How it works
 
@@ -44,8 +44,8 @@ The server runs one game for everyone. It simulates each drop in full the moment
 
 Every open page holds one stream from the server (as [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)) carrying two kinds of message:
 
-- A public "game" message, 10 times a second, identical for every player: the countdown, the total bets on each side, and while the ball is falling, its next few positions.
-- A private "me" message with your points and bets, sent when you connect and after each round. Placing a bet returns the same information.
+- A public "game" message, 10 times a second, identical for every player: the countdown, the price of each side, and while the ball is falling, its next few positions.
+- A private "me" message with your points and shares, sent when you connect and after each round. Buying a share returns the same information.
 
 Ball positions are sent up to 12 frames (a fifth of a second) early and the page plays them back on its own clock, which keeps the ball moving smoothly when the network delivers messages unevenly. That is as far ahead as a page ever sees, and betting closes that same fifth of a second before the ball passes the last row, so nobody can bet on a result they have already been sent.
 
