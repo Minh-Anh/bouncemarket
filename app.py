@@ -5,12 +5,15 @@ import argparse
 import asyncio
 import bisect
 import contextlib
+import datetime
 import json
 import math
 import os
 import random
+import struct
 import time
 import uuid
+import zlib
 
 import httpx
 import uvicorn
@@ -27,15 +30,11 @@ LAST_ROW_Y = FIRST_ROW_Y + (ROWS - 1) * ROW_GAP
 # The side walls lean inwards, so the board is a trapezoid: WIDTH across the top, and
 # WALL_SLANT narrower on each side at the floor. The pins squeeze together as the walls close in.
 WALL_SLANT = 60
-WALL_LENGTH = math.hypot(WALL_SLANT, HEIGHT)
+WALL_LENGTH = math.sqrt(WALL_SLANT**2 + HEIGHT**2)
 
-# Physics. Gravity and bounce can be set on the command line, e.g. --bounce 0.3
-parser = argparse.ArgumentParser()
-parser.add_argument("--gravity", type=float, default=400, help="pixels / second^2")
-parser.add_argument("--bounce", type=float, default=0.85, help="fraction of speed kept after hitting something, 0 to 1")
-args = parser.parse_args()
-GRAVITY = args.gravity
-BOUNCE = args.bounce
+# Physics. Gravity and bounce can be set on the command line, e.g. --bounce 0.3 (see the bottom of the file).
+GRAVITY = 400.0  # pixels / second^2
+BOUNCE = 0.85  # fraction of speed kept after hitting something, 0 to 1
 DT = 1 / 240  # seconds per physics step
 STEPS_PER_FRAME = 4  # the page is sent one ball position per frame
 FRAME_SECONDS = STEPS_PER_FRAME * DT  # 1/60 second
@@ -54,6 +53,14 @@ LEADERBOARD_SIZE = 10
 NEIGHBORS = 2  # a player ranked below the top 10 also sees this many players either side of them
 PAGE_SIZE = 1000  # the most rows Supabase returns from one request, unless its settings say otherwise
 SEED_SHARES = 1  # pretend shares on each side, so the price starts at 0.50. Fewer makes early buys swing it harder
+
+# The round log: every round a player bought in is saved to the database, for analysis later.
+# See "The round log" below, and analysis.py, which reads it back.
+LOG_FORMAT = 1  # saved with each round; change it whenever pack_path() or pack_buys() change what they write
+COMMIT = os.environ.get("RENDER_GIT_COMMIT", "local")  # which version of this code played the round; Render sets this
+UNSAVED_ROUNDS_KEPT = 20  # if the database can't be reached, this many rounds wait in memory, and older ones are dropped
+KEYS_PER_REQUEST = 500  # the most players whose keys (see player_keys) are asked for in one request to the database
+NOT_SEEN = 0xFFFF  # stands in for the frame a page was showing when it didn't say
 
 
 def wall_inset(y):
@@ -100,14 +107,18 @@ game = {
     "dropping": False,
     "drops_at": time.time() + COUNTDOWN_SECONDS,  # when the countdown ends
     "started_at": 0,  # when the ball dropped
+    "start_x": None,  # where along the top the ball dropped from. The whole path follows from this one number
     "path": None,
     "bucket": None,
     "close_frame": 0,  # betting closes when the ball reaches this frame
     "counterparty_buys": [],  # the counterparty's buys this drop, as [(frame, side)], from counterparty_buys()
     "sent_frames": 0,  # how many frames of the path have been sent to the pages so far
     "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
+    "buys": [],  # every player buy this round, in order, for the round log. See buy()
     "last_bucket": None,  # where the previous ball landed
-    "landed": {"left": 0, "right": 0},  # how many balls have landed in each bucket
+    # How many balls have landed in each bucket: the logged rounds in the database (see
+    # load_landed()), plus every ball since the server started.
+    "landed": {"left": 0, "right": 0},
     "ranking": [],  # every named player, most points first, as [{"name": ..., "points": ...}], made from named_points
     "positions": {},  # each name's index in "ranking", so a player can be found quickly
     "minus_points": [],  # minus each player's points, in "ranking" order, so it ascends for bisect
@@ -127,20 +138,35 @@ named_points = {}
 # One entry per open page: a queue of messages waiting to be sent to it, and whose page it is.
 streams = {}  # {queue: player_id}
 
+# The round log gives every player who has ever bought a share a small whole number, their
+# key, and uses it in place of their long id, so each logged buy takes a few bytes.
+# {player_id: key}, for the players we have asked the database about since the server started.
+player_keys = {}
 
-def simulate_drop():
-    """Drop one ball. Returns its position at every frame, and the bucket it lands in."""
-    # Drop from somewhere in the middle two-thirds, so the ball never just slides down a slanted wall.
-    x, y = random.uniform(WIDTH / 6, WIDTH * 5 / 6), 0.0
+# Rounds waiting to be saved to the round log, oldest first, each as made by round_log().
+unsaved_rounds = []
+
+
+def simulate_drop(start_x, gravity, bounce):
+    """Drop one ball from start_x along the top. Returns its state at every frame, as
+    [(x, y, vx, vy)] (position and velocity), and the bucket it lands in.
+
+    The same start_x, gravity and bounce always give exactly the same drop, on any computer.
+    The sums use only + - * / and square roots, which every computer rounds the same way
+    (math.hypot, for one, is not promised to). That matters because the path is chaotic: the
+    tiniest difference early on lands the ball in the other bucket. It is what lets the round
+    log save one number for a drop and analysis.py replay it later, velocities included.
+    """
+    x, y = start_x, 0.0
     vx, vy = 0.0, 0.0
-    path = []
+    states = []
     step = 0
     while y < HEIGHT - BALL_R:
         if step % STEPS_PER_FRAME == 0:
-            path.append((round(x, 1), round(y, 1)))
+            states.append((x, y, vx, vy))
         step += 1
 
-        vy += GRAVITY * DT
+        vy += gravity * DT
         x += vx * DT
         y += vy * DT
 
@@ -155,18 +181,18 @@ def simulate_drop():
                 x, y = x + nx * (BALL_R - distance), y + ny * (BALL_R - distance)
                 speed_into_wall = -(vx * nx + vy * ny)
                 if speed_into_wall > 0:
-                    vx += (1 + BOUNCE) * speed_into_wall * nx
-                    vy += (1 + BOUNCE) * speed_into_wall * ny
+                    vx += (1 + bounce) * speed_into_wall * nx
+                    vy += (1 + bounce) * speed_into_wall * ny
 
         # Divider between the buckets: a wall from the last row's center pin to the floor.
         if y > LAST_ROW_Y and abs(x - WIDTH / 2) < BALL_R:
             side = 1 if x > WIDTH / 2 else -1
-            x, vx = WIDTH / 2 + side * BALL_R, side * abs(vx) * BOUNCE
+            x, vx = WIDTH / 2 + side * BALL_R, side * abs(vx) * bounce
 
         # Pins.
         for pin_x, pin_y in PINS:
             dx, dy = x - pin_x, y - pin_y
-            dist = math.hypot(dx, dy)
+            dist = math.sqrt(dx * dx + dy * dy)
             if dist < BALL_R + PIN_R:
                 # (nx, ny) points from the pin to the ball.
                 nx, ny = dx / dist, dy / dist
@@ -175,11 +201,16 @@ def simulate_drop():
                 # If the ball is moving into the pin, reflect that part of its velocity.
                 speed_into_pin = -(vx * nx + vy * ny)
                 if speed_into_pin > 0:
-                    vx += (1 + BOUNCE) * speed_into_pin * nx
-                    vy += (1 + BOUNCE) * speed_into_pin * ny
+                    vx += (1 + bounce) * speed_into_pin * nx
+                    vy += (1 + bounce) * speed_into_pin * ny
 
     bucket = "left" if x < WIDTH / 2 else "right"
-    return path, bucket
+    return states, bucket
+
+
+def positions(states):
+    """The ball's position at every frame, rounded to tenths of a pixel: the path the game itself uses."""
+    return [(round(x, 1), round(y, 1)) for x, y, vx, vy in states]
 
 
 def parse_id(text):
@@ -316,9 +347,12 @@ def current_frame():
     return int((time.time() - game["started_at"]) / FRAME_SECONDS)
 
 
-def betting_open():
-    """Shares can be bought from the moment the ball drops until it reaches close_frame."""
-    return game["dropping"] and current_frame() < game["close_frame"]
+def betting_open(frame=None):
+    """Shares can be bought from the moment the ball drops until it reaches close_frame.
+    Asks about the frame given, or about right now if none is."""
+    if frame is None:
+        frame = current_frame()
+    return game["dropping"] and frame < game["close_frame"]
 
 
 def counterparty_buys(path, close_frame):
@@ -342,35 +376,47 @@ def counterparty_buys(path, close_frame):
     return buys
 
 
-def counterparty_shares():
-    """How many shares the counterparty has bought on each side so far this round.
+def shares_by_frame(buys, frame):
+    """How many shares have been bought on each side up to and including a frame, given the
+    buys so far as [(frame, side)] in frame order, the form counterparty_buys() returns."""
+    shares = {"left": 0, "right": 0}
+    for buy_frame, side in buys:
+        if buy_frame > frame:
+            break
+        shares[side] += 1
+    return shares
+
+
+def counterparty_shares(frame=None):
+    """How many shares the counterparty has bought on each side so far this round: up to the
+    frame given, or up to right now if none is.
 
     It never collects on them. They only move the price, towards the side the ball has been
     spending its time on, and most of all towards where it has been lately.
     """
-    shares = {"left": 0, "right": 0}
-    if game["dropping"]:
-        now = current_frame()
-        for frame, side in game["counterparty_buys"]:
-            if frame > now:
-                break
-            shares[side] += 1
-    return shares
+    if not game["dropping"]:
+        return {"left": 0, "right": 0}
+    return shares_by_frame(game["counterparty_buys"], current_frame() if frame is None else frame)
 
 
-def prices():
-    """What one share on each side costs right now. A share pays 1 point if its side wins.
+def prices_for(left, right):
+    """What one share on each side costs once this many shares have been bought on each side.
+    A share pays 1 point if its side wins.
 
     The price of a side is its fraction of all the shares bought this round, by players and
     by the counterparty. So a side that everyone is buying gets expensive, and the two
     prices always add up to 1.
     """
-    theirs = counterparty_shares()
-    left = game["shares"]["left"] + theirs["left"] + SEED_SHARES
-    right = game["shares"]["right"] + theirs["right"] + SEED_SHARES
+    left, right = left + SEED_SHARES, right + SEED_SHARES
     left_price = round(left / (left + right), 2)
     left_price = min(0.99, max(0.01, left_price))  # never free, and never a sure loss
     return {"left": left_price, "right": round(1 - left_price, 2)}
+
+
+def prices(frame=None):
+    """What one share on each side costs at the frame given, or right now if none is."""
+    theirs = counterparty_shares(frame)
+    return prices_for(game["shares"]["left"] + theirs["left"], game["shares"]["right"] + theirs["right"])
 
 
 def sse(event, data):
@@ -413,11 +459,206 @@ def settle():
     return rows
 
 
+# The round log. Every round that at least one player bought in becomes one row of the
+# "rounds" table: where the ball dropped from, its path, where it landed, and every buy.
+# The path and the buys are packed into a few bytes each, because the buys are nearly all of
+# what gets stored: a thousand players buying three shares a round is about 8 million buys in
+# ten hours. analysis.py reads the log back and unpacks it.
+
+
+def pack_path(path):
+    """A path as bytes. Every position is in tenths of a pixel, which makes it a whole number,
+    and is stored as its change from the frame before (the first as it is): x then y, each a
+    2-byte signed integer, low byte first. The changes are small and repetitive, so zlib then
+    squeezes a typical path to under a kilobyte."""
+    tenths = [(round(x * 10), round(y * 10)) for x, y in path]
+    numbers = list(tenths[0])
+    for before, after in zip(tenths, tenths[1:]):
+        numbers += [after[0] - before[0], after[1] - before[1]]
+    return zlib.compress(struct.pack(f"<{len(numbers)}h", *numbers), 9)
+
+
+def unpack_path(data):
+    """The path that pack_path() packed, as [(x, y)]."""
+    data = zlib.decompress(data)
+    numbers = struct.unpack(f"<{len(data) // 2}h", data)
+    path = []
+    x = y = 0
+    for i in range(0, len(numbers), 2):
+        x, y = x + numbers[i], y + numbers[i + 1]
+        path.append((x / 10, y / 10))
+    return path
+
+
+# How pack_buys() stores each fact about a buy: one column per fact, each holding one number
+# per buy, in the order the buys were made. The letter is the size of the number, as the
+# struct module spells it. All the frames, then all the lags, and so on: zlib squeezes columns
+# of alike numbers much smaller than it would the same numbers buy by buy.
+BUY_COLUMNS = (
+    ("frames", "H"),  # 2 bytes. The server's frame at the buy, minus the frame of the buy before (the first as it is)
+    ("lags", "h"),  # 2 bytes, signed. How many frames behind that the page said it was showing; NO_LAG if it didn't say
+    ("keys", "I"),  # 4 bytes. The player's key, from the player_keys table
+    ("sides", "B"),  # 1 byte. 0 for left, 1 for right
+    ("prices", "B"),  # 1 byte. The price paid, in hundredths of a point
+    ("points", "I"),  # 4 bytes. The player's points just before the buy, in hundredths
+)
+BUY_FORMAT = "<" + "".join("{n}" + letter for name, letter in BUY_COLUMNS)  # "<" means low byte first, no padding
+BUY_BYTES = struct.calcsize(BUY_FORMAT.format(n=1))  # 14 bytes a buy, before zlib
+NO_LAG = -0x8000
+
+
+def pack_buys(buys):
+    """A round's buys as bytes, given as [(frame, seen_frame, key, side, price, points)] in the
+    order they were made. BUY_COLUMNS says how. Numbers too big for their column are capped."""
+    columns = {name: [] for name, letter in BUY_COLUMNS}
+    last_frame = 0
+    for frame, seen_frame, key, side, price, points in buys:
+        columns["frames"].append(min(0xFFFF, max(0, frame - last_frame)))
+        last_frame = max(last_frame, frame)
+        columns["lags"].append(NO_LAG if seen_frame == NOT_SEEN else min(0x7FFF, max(-0x7FFF, frame - seen_frame)))
+        columns["keys"].append(key)
+        columns["sides"].append(0 if side == "left" else 1)
+        columns["prices"].append(round(price * 100))
+        columns["points"].append(min(0xFFFFFFFF, max(0, round(points * 100))))
+    numbers = [number for name, letter in BUY_COLUMNS for number in columns[name]]
+    return zlib.compress(struct.pack(BUY_FORMAT.format(n=len(buys)), *numbers), 9)
+
+
+def unpack_buys(data):
+    """The buys that pack_buys() packed, in the same form. seen_frame is None where the page didn't say."""
+    data = zlib.decompress(data)
+    n = len(data) // BUY_BYTES
+    numbers = struct.unpack(BUY_FORMAT.format(n=n), data)
+    frames, lags, keys, sides, cents, points = (numbers[i * n:(i + 1) * n] for i in range(len(BUY_COLUMNS)))
+    buys = []
+    frame = 0
+    for i in range(n):
+        frame += frames[i]
+        seen_frame = None if lags[i] == NO_LAG else frame - lags[i]
+        buys.append((frame, seen_frame, keys[i], "right" if sides[i] else "left", cents[i] / 100, points[i] / 100))
+    return buys
+
+
+def to_bytea(data):
+    """Bytes in the text form the database takes for a bytea (raw bytes) column: \\x and then hexadecimal."""
+    return "\\x" + data.hex()
+
+
+def round_log():
+    """The round that just finished, as a row for the "rounds" table, or None if no player
+    bought anything in it. Rounds nobody played aren't logged: they are most rounds on a quiet
+    day, and analysis.py can make as many drops of its own as it likes.
+
+    "buys" is still the list buy() made, with each player's long id. save_rounds() packs it,
+    once it knows every buyer's key.
+    """
+    if not game["buys"]:
+        return None
+    return {
+        "started_at": datetime.datetime.fromtimestamp(game["started_at"], datetime.timezone.utc).isoformat(),
+        "commit_id": COMMIT,
+        "gravity": GRAVITY,
+        "bounce": BOUNCE,
+        "start_x": game["start_x"],
+        "frames": len(game["path"]),
+        "close_frame": game["close_frame"],
+        "bucket": game["bucket"],
+        "format": LOG_FORMAT,
+        "path": to_bytea(pack_path(game["path"])),
+        "buys": game["buys"],
+    }
+
+
+async def save_rounds():
+    """Write every round in unsaved_rounds to the database, in two steps.
+
+    First, ask the database for the key of every buyer we don't know the key of yet. It makes
+    up a new key for anyone it hasn't seen before, and hands back the old one for anyone it has.
+    Then write the rounds, each with its buys packed. No two rounds start at the same moment,
+    and the database skips a round it already has, so trying again after a failure that was
+    really a success doesn't save a round twice.
+    """
+    logs = list(unsaved_rounds)  # more may finish while we wait for the database; they are saved next time
+    new_ids = sorted({buy[2] for log in logs for buy in log["buys"]} - player_keys.keys())
+    for start in range(0, len(new_ids), KEYS_PER_REQUEST):
+        response = await db.post(
+            "/player_keys",
+            params={"on_conflict": "id"},
+            json=[{"id": player_id} for player_id in new_ids[start:start + KEYS_PER_REQUEST]],
+            headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+        )
+        response.raise_for_status()
+        for row in response.json():
+            player_keys[row["id"]] = row["key"]
+
+    rows = []
+    for log in logs:
+        buys = [(frame, seen, player_keys[player_id], *rest) for frame, seen, player_id, *rest in log["buys"]]
+        rows.append({**log, "n_buys": len(buys), "buys": to_bytea(pack_buys(buys))})
+    response = await db.post(
+        "/rounds",
+        params={"on_conflict": "started_at"},
+        json=rows,
+        headers={"Prefer": "resolution=ignore-duplicates"},
+    )
+    response.raise_for_status()
+    saved = {log["started_at"] for log in logs}
+    unsaved_rounds[:] = [log for log in unsaved_rounds if log["started_at"] not in saved]
+
+
+async def save_round_logs():
+    """Save each logged round soon after it finishes, for as long as the server runs.
+
+    If the database can't be reached, the rounds wait in unsaved_rounds (the newest
+    UNSAVED_ROUNDS_KEPT of them) and we try again every 30 seconds.
+    """
+    while True:
+        await asyncio.sleep(1)
+        if not unsaved_rounds:
+            continue
+        try:
+            await save_rounds()
+        except (httpx.HTTPError, KeyError) as error:  # KeyError: the database didn't hand back a key we asked for
+            print("Could not save the round log, trying again in 30 seconds:", repr(error))
+            await asyncio.sleep(30)
+
+
+async def load_landed():
+    """Start the "past X drops" tally from the round log, once, when the server starts, so it
+    carries on from before a restart instead of starting again from nothing.
+
+    The tally then counts every ball that lands, but the log only has the rounds somebody
+    bought in. So after a restart the tally steps back by the rounds nobody played. And once
+    the log is long, the database answers with its own quick estimate of the count, not an
+    exact one. Neither matters for a tally whose point is "about half each".
+    If the database can't be reached, we keep trying every 30 seconds, like load_ranking().
+    """
+    while True:
+        counts = {}
+        try:
+            for side in ("left", "right"):
+                # A HEAD request asks for no rows, only how many there are, which comes back
+                # in a header that looks like "0-9/1234" or "*/1234".
+                response = await db.head("/rounds", params={"bucket": "eq." + side}, headers={"Prefer": "count=estimated"})
+                response.raise_for_status()
+                counts[side] = int(response.headers["Content-Range"].split("/")[1])
+        except (httpx.HTTPError, KeyError, ValueError, IndexError) as error:
+            print("Could not load the tally of past drops, trying again in 30 seconds:", repr(error))
+            await asyncio.sleep(30)
+            continue
+        for side, count in counts.items():
+            game["landed"][side] += count  # added, not set: balls may have landed while we were asking
+        return
+
+
 async def run_rounds():
     """The round loop: wait for the countdown, drop a ball, wait for it to land, pay out. Forever."""
     while True:
         await asyncio.sleep(max(0, game["drops_at"] - time.time()))
-        path, bucket = simulate_drop()
+        # Drop from somewhere in the middle two-thirds, so the ball never just slides down a slanted wall.
+        start_x = random.uniform(WIDTH / 6, WIDTH * 5 / 6)
+        states, bucket = simulate_drop(start_x, GRAVITY, BOUNCE)
+        path = positions(states)
         last_row_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
         # Pages see BUFFER_FRAMES ahead, so betting closes that long before the ball
         # passes the last row. Nobody can bet after seeing which side of the divider it took.
@@ -425,14 +666,21 @@ async def run_rounds():
         game.update(
             dropping=True,
             started_at=time.time(),
+            start_x=start_x,
             path=path,
             bucket=bucket,
             close_frame=close_frame,
             counterparty_buys=counterparty_buys(path, close_frame),
             sent_frames=0,
+            buys=[],
         )
         await asyncio.sleep(len(path) * FRAME_SECONDS)
         rows = settle()
+        log = round_log()
+        if log:
+            # save_round_logs() writes it to the database in its own time, so a slow database never holds up the game.
+            unsaved_rounds.append(log)
+            del unsaved_rounds[:-UNSAVED_ROUNDS_KEPT]
         game["dropping"] = False
         game["drops_at"] = time.time() + COUNTDOWN_SECONDS
         try:
@@ -565,14 +813,22 @@ async def buy(request):
     side = data["side"]
     if side not in ("left", "right"):
         return JSONResponse({"error": "bad side."}, status_code=400)
-    player = players.get(parse_id(data["player"]))
+    player_id = parse_id(data["player"])
+    player = players.get(player_id)
     if player is None:
         return JSONResponse({"error": "unknown player."}, status_code=400)
-    if not betting_open():
+    frame = current_frame()  # read the clock once, so the logged frame is the one the price was worked out at
+    if not betting_open(frame):
         return JSONResponse({"error": "trading is closed."}, status_code=400)
-    price = prices()[side]
+    price = prices(frame)[side]
     if price > player["points"]:
         return JSONResponse({"error": "you don't have enough points."}, status_code=400)
+    # For the round log. The page says which frame it was showing when the button was pressed,
+    # which is a little behind the server's frame. It's the page's word, so only good for analysis.
+    seen_frame = data.get("frame")
+    if type(seen_frame) is not int or not 0 <= seen_frame < NOT_SEEN:
+        seen_frame = NOT_SEEN
+    game["buys"].append((frame, seen_frame, player_id, side, price, player["points"]))
     player["points"] = round(player["points"] - price, 2)
     player["spent"] = round(player["spent"] + price, 2)
     player["shares"][side] += 1
@@ -636,9 +892,11 @@ async def reset_points(request):
 
 @contextlib.asynccontextmanager
 async def lifespan(app):
-    """When the server starts: load the leaderboard, and start the round loop and the broadcaster.
+    """When the server starts: load the leaderboard and the tally of past drops, and start the
+    round loop, the broadcaster and the saving of the round log.
     The game starts straight away, even if the leaderboard takes a few tries to load."""
-    tasks = [asyncio.create_task(load_ranking()), asyncio.create_task(run_rounds()), asyncio.create_task(broadcast())]
+    jobs = [load_ranking(), load_landed(), run_rounds(), broadcast(), save_round_logs()]
+    tasks = [asyncio.create_task(job) for job in jobs]
     yield
     for task in tasks:
         task.cancel()
@@ -657,6 +915,11 @@ app = Starlette(
 )
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gravity", type=float, default=GRAVITY, help="pixels / second^2")
+    parser.add_argument("--bounce", type=float, default=BOUNCE, help="fraction of speed kept after hitting something, 0 to 1")
+    args = parser.parse_args()
+    GRAVITY, BOUNCE = args.gravity, args.bounce
     # uvicorn runs everything on one thread, switching between pages whenever one is waiting,
     # so thousands of open pages are cheap. Render tells us the port through the PORT variable.
     # The short shutdown timeout lets Ctrl-C work while pages still have streams open.

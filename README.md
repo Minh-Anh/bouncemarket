@@ -14,9 +14,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 uv installs the Python dependencies (the Starlette web framework, the uvicorn server and the httpx web client, declared at the top of `app.py`) automatically on first run.
 
-A [Supabase](https://supabase.com) project, which stores the named players. To set it up:
+A [Supabase](https://supabase.com) project, which stores the named players and the round log. To set it up:
 
-1. In the Supabase dashboard, open the SQL editor and run the contents of `schema.sql`.
+1. In the Supabase dashboard, open the SQL editor and run the contents of `schema.sql`. It only adds what is missing, so run it again whenever it changes.
 2. Create a file called `.env` in this folder (git ignores it) with the project's URL and its secret key, both found under the project's API settings:
 
 ```
@@ -72,6 +72,46 @@ If the database can't be reached, the game carries on: everyone can still play, 
 
 Players without a name live only in the server's memory, and lose their points when it restarts. Once you claim a name, your id, name and points are a row in the Supabase `players` table. The server saves your points there after every round you play in, and loads them back the next time your browser connects.
 
+The "past X drops" tally also survives a restart, roughly: when the server starts, it counts the rounds in the round log (below), then adds every ball that lands. The log only has the rounds somebody bought in, so after a restart the tally steps back by the rounds nobody played, and once the log is long the database answers with an estimate, not an exact count.
+
+## The round log
+
+Every round that at least one player bought in is saved to the database, for analysis later: how well the market's odds track the real ones, and how players differ in the way they play. Rounds nobody bought in aren't saved.
+
+Each is one row of the `rounds` table:
+
+| Column | Meaning |
+| ------ | ------- |
+| `started_at` | When the ball dropped. |
+| `commit_id` | The version of the code that played the round (Render's `RENDER_GIT_COMMIT`, or `local`). |
+| `gravity`, `bounce` | The physics options the server was running with. |
+| `start_x` | Where along the top the ball dropped from. |
+| `frames`, `close_frame` | How many frames (60 a second) the ball took to land, and the frame betting closed at. |
+| `bucket` | Where the ball landed. |
+| `path` | The ball's position at every frame, packed. |
+| `buys`, `n_buys` | Every buy, in order, packed, and how many there are. |
+| `format` | How `path` and `buys` are packed (`LOG_FORMAT` in `app.py`). |
+
+A drop is decided entirely by `start_x`, `gravity` and `bounce`: the same three numbers give exactly the same path on any computer. So the analysis plays each round again to get the ball's exact position and velocity at every frame, and nothing about the ball is stored per buy. The saved `path` (under a kilobyte) is there to check the replay against, and to fall back on if the physics in `app.py` ever changes. If it does, a round still replays under the version in its `commit_id`.
+
+For each buy, the log keeps the server's frame when it took the buy, the frame the player's page said it was showing when the button was pressed (a little earlier, and what the player was actually looking at), who bought, which side, the price paid, and the player's points just before. The page's frame is the page's word, so it's only good for analysis. Everything else about the market at that moment follows from the buys before it and the path: the counterparty's buys are worked out from the path, and the price from the shares.
+
+The buys are nearly all of what gets stored (a thousand players buying three shares a round is about 8 million buys in ten hours), so they are packed small: about 7 bytes each, against about 80 as database rows of their own. The price of that is that the database can't search inside them. `pack_buys()` in `app.py` describes the layout. In place of each player's long id, a buy holds a small number, the player's key, from the `player_keys` table. Every player gets one the first time they buy, named or not.
+
+Rounds are saved a second or so after they finish, by a separate task, so a slow database never holds up the game. If the database can't be reached, up to 20 rounds wait in memory and are saved when it is back.
+
+### Reading it back
+
+```
+uv run --env-file .env analysis.py buys.csv
+```
+
+writes one line per buy ever made: the round, the player (their key, and their name if they have one), the frame, the side, the price, their points, the ball's position and velocity at the server's frame and at the frame the page was showing, the shares players and the counterparty had bought on each side just before, where the ball landed, and what the share made. End the file name in `.gz` to have it compressed. The top of `analysis.py` lists the columns.
+
+It also says if any rounds didn't replay to the path that was saved, or if any buys weren't at the price today's `app.py` would charge. Either means the rules have changed since those rounds were played.
+
+To work with whole rounds in Python instead, `analysis.rounds()` gives each one with its path, its exact state at every frame, and its buys.
+
 ## Tuning the physics
 
 Gravity and bounce can be passed on the command line:
@@ -86,3 +126,5 @@ uv run app.py --gravity 1500 --bounce 0.3
 | `--bounce`  | 0.85    | Fraction of speed kept after hitting a pin or wall, 0 to 1. Lower makes the ball slow down more in the dense rows. |
 
 Everything else (board size, pin rows, ball and pin size) is a constant at the top of `app.py`.
+
+The round log saves the gravity and bounce each round was played with, so rounds played under different options replay correctly. A change to one of the constants is only recorded as a new `commit_id`.

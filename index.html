@@ -227,6 +227,7 @@
     let leaderboard = { top: [], around_me: [] };  // the latest leaderboard message: the top players, and the players around us if we're below them
     let queue = [];  // ball positions waiting until their frame is due, each [frame, x, y]
     let dropStart = null;  // on our clock, the moment the ball dropped
+    let shownFrame = null;  // the frame of the ball position on screen right now (null between drops)
     let dropsAt = null;  // on our clock, the moment the next ball will drop (only between drops)
 
     // A random id, remembered by this browser, that tells the server which player we are.
@@ -353,13 +354,14 @@
     }
 
     // Each buy button asks the server to buy one share on its side at the current price.
-    // The server answers with our new points and shares.
+    // The server answers with our new points and shares. We also say which frame we were showing,
+    // which the server only keeps for its log: it tells an analysis what the player was looking at.
     for (const buyButton of document.querySelectorAll(".side button")) {
       buyButton.onclick = async () => {
         const response = await fetch("/buy", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ player: playerId, side: buyButton.dataset.side }),
+          body: JSON.stringify({ player: playerId, side: buyButton.dataset.side, frame: shownFrame }),
         });
         if (response.ok) {
           me = await response.json();
@@ -470,6 +472,7 @@
       if (!game.dropping) {
         queue = [];
         dropStart = null;
+        shownFrame = null;
         // Set once per countdown, so network jitter in later messages doesn't make the fade flicker.
         if (dropsAt === null) dropsAt = performance.now() + game.seconds_to_drop * 1000;
       } else {
@@ -488,7 +491,10 @@
         const dueFrame = (now - dropStart) / 1000 * FPS;
         let latest = null;
         while (queue.length > 0 && queue[0][0] <= dueFrame) latest = queue.shift();
-        if (latest) draw([latest[1], latest[2]]);
+        if (latest) {
+          draw([latest[1], latest[2]]);
+          shownFrame = latest[0];
+        }
       } else if (dropsAt !== null) {
         draw(null);
         if (game) showCountdown();
