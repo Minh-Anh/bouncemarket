@@ -6,66 +6,134 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>bouncemarket</title>
   <style>
-    body { font-family: sans-serif; text-align: center; background: #111; color: #eee; margin: 8px; }
-    p { margin: 8px 0; }
+    /* The whole palette: yellow as the accent, deep purple for the buy buttons, and three greys. */
+    :root {
+      --background: #111;
+      --panel: #1c1c1c;
+      --text: #eee;
+      --muted: #999;
+      --accent: #fc3;
+      --buy: #5b21b6;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }  /* without this, a display rule below would un-hide a hidden element */
+    body {
+      margin: 0; background: var(--background); color: var(--text);
+      font: 15px/1.4 system-ui, sans-serif;
+      font-variant-numeric: tabular-nums;  /* digits all the same width, so numbers don't jiggle as they change */
+    }
+    h1, h2, p { margin: 0; }
+    h1 { font-size: 18px; }
+    h2, .label { font-size: 12px; font-weight: bold; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .muted { color: var(--muted); font-size: 13px; }
+    .panel { background: var(--panel); border-radius: 12px; padding: 12px 14px; }
+
+    /* Top bar: the title on the left, this player's name and points on the right. */
+    #page { max-width: 760px; margin: 0 auto; padding: 0 16px 24px; }
+    header { display: flex; justify-content: space-between; align-items: baseline; padding: 12px 0; }
+    #points { font-size: 18px; font-weight: bold; color: var(--accent); }
+
+    /* Two columns side by side: the game, then the leaderboard taking the space that is left.
+       On a narrow screen the leaderboard doesn't fit beside the game, so it wraps underneath. */
+    main { display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-start; gap: 20px; }
+    #game { flex: 0 1 400px; display: grid; gap: 10px; }
+    #sidebar { flex: 1 1 260px; display: grid; gap: 10px; }
+
     /* The board shrinks to fit a small screen, keeping its shape, and never takes more than
-       half the screen's height, so the bet buttons stay in view below it. */
-    canvas { background: #222; display: block; margin: 0 auto; max-width: 100%; max-height: 50dvh; }
-    #bets { display: flex; max-width: 400px; margin: 0 auto; }
-    .side { flex: 1; }
+       half the screen's height, so the buy buttons stay in view below it. */
+    #board { padding: 0; }
+    canvas { display: block; margin: 0 auto; max-width: 100%; max-height: 50dvh; }
+
+    /* The two halves sit on one line when there is room, and stack on a narrow phone. */
+    #status-line { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; column-gap: 12px; font-size: 17px; }
+    #status { font-weight: bold; color: var(--accent); }
+    #countdown { color: var(--muted); }
+
+    /* One panel per side: its price and our holding on the left, its buy button on the right. */
+    #market { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .side { display: flex; justify-content: space-between; align-items: center; }
+    .price { font-size: 30px; font-weight: bold; line-height: 1.2; }
     .side button {
       width: 56px; height: 56px; border: none; border-radius: 50%;
-      font-size: 32px; font-weight: bold; color: #111; cursor: pointer;
+      font-size: 32px; font-weight: bold; color: var(--text); background: var(--buy); cursor: pointer;
       touch-action: manipulation;  /* stops a quick double tap from zooming the page */
     }
     .side button:active { transform: scale(0.9); }
     .side button:disabled { opacity: 0.3; cursor: default; }
-    .side .price { font-size: 22px; font-weight: bold; }
-    #left-side button { background: #f9a8d4; }
-    #right-side button { background: #93c5fd; }
-    /* Room for two lines, so the page doesn't jump when a long message wraps on a phone. */
-    #message { font-size: 18px; font-weight: bold; color: #fc3; min-height: 2.4em; }
-    #name, #claim button { font-size: 16px; padding: 6px 10px; border-radius: 8px; border: none; }
-    #name { width: 11em; }
-    #claim button { background: #fc3; color: #111; font-weight: bold; cursor: pointer; }
-    #leaderboard { display: inline-block; text-align: left; margin: 0; }
-    #leaderboard .me { color: #fc3; font-weight: bold; }
+
+    #claim { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    #name, #claim button { font: inherit; padding: 6px 10px; border-radius: 8px; border: none; }
+    #name { flex: 1; min-width: 0; }
+    #claim button { background: var(--accent); color: #111; font-weight: bold; cursor: pointer; }
+    #claim-error { width: 100%; }
+
+    /* Each row: its rank (added by the browser), the name, and the points pushed to the right. */
+    #leaderboard { margin: 8px 0 0; padding-left: 24px; }
+    #leaderboard li { padding: 3px 0; }
+    #leaderboard .points { float: right; font-weight: bold; }
+    #leaderboard .me { color: var(--accent); }
   </style>
 </head>
 <body>
-  <canvas id="canvas"></canvas>
-  <p id="message">&nbsp;</p>
-  <p>Points: <span id="points"></span></p>
-  <div id="bets">
-    <div class="side" id="left-side">
-      <p>Left share: <span class="price" id="price-left"></span></p>
-      <button data-side="left">+</button>
-      <p>You hold <span id="shares-left">0</span></p>
-    </div>
-    <div class="side" id="right-side">
-      <p>Right share: <span class="price" id="price-right"></span></p>
-      <button data-side="right">+</button>
-      <p>You hold <span id="shares-right">0</span></p>
-    </div>
-  </div>
-  <p>Each share pays 1 point if the ball lands on its side.</p>
-  <p>Landed left: <span id="left"></span> &nbsp;|&nbsp; Landed right: <span id="right"></span></p>
-  <p>Players online: <span id="online"></span></p>
+<div id="page">
+  <header>
+    <h1>bouncemarket</h1>
+    <p><span class="muted" id="my-name"></span> &nbsp;<span id="points"></span> <span class="muted">points</span></p>
+  </header>
 
-  <!-- Shown until this player has claimed a name. -->
-  <form id="claim" hidden>
-    <input id="name" maxlength="16" placeholder="Your name" autocomplete="off">
-    <button>Join the leaderboard</button>
-    <p id="claim-error"></p>
-  </form>
-  <p id="playing-as" hidden>Playing as <b id="my-name"></b></p>
-  <h3>Leaderboard</h3>
-  <ol id="leaderboard"></ol>
+  <main>
+    <section id="game">
+      <div class="panel" id="board"><canvas id="canvas"></canvas></div>
+
+      <div id="status-line">
+        <span id="status">&nbsp;</span>
+        <span id="countdown"></span>
+      </div>
+
+      <div id="market">
+        <div class="side panel" id="left-side">
+          <div>
+            <p class="label">Left</p>
+            <p class="price" id="price-left"></p>
+            <p class="muted">You hold <span id="shares-left">0</span></p>
+          </div>
+          <button data-side="left">+</button>
+        </div>
+        <div class="side panel" id="right-side">
+          <div>
+            <p class="label">Right</p>
+            <p class="price" id="price-right"></p>
+            <p class="muted">You hold <span id="shares-right">0</span></p>
+          </div>
+          <button data-side="right">+</button>
+        </div>
+      </div>
+
+      <p class="muted">+ buys one share at the price shown. A share pays 1 point if the ball lands on its side.</p>
+    </section>
+
+    <section id="sidebar">
+      <div class="panel">
+        <h2>Leaderboard</h2>
+        <!-- Shown until this player has claimed a name. -->
+        <form id="claim" hidden>
+          <input id="name" maxlength="16" placeholder="Your name" autocomplete="off">
+          <button>Join</button>
+          <p class="muted" id="claim-error"></p>
+        </form>
+        <ol id="leaderboard"></ol>
+      </div>
+      <p class="muted">
+        Landed left <span id="left"></span> · right <span id="right"></span>
+        &nbsp;·&nbsp; <span id="online"></span> online
+      </p>
+    </section>
+  </main>
+</div>
 
   <script>
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
-    const message = document.getElementById("message");
     const FPS = 60;  // the ball moves one frame every 1/60 second
     let board;
     let game = null;  // the latest public message: the state of the shared game
@@ -110,8 +178,7 @@
 
       // Offer the name form until we have a name, then show the name instead.
       document.getElementById("claim").hidden = me.name !== null;
-      document.getElementById("playing-as").hidden = me.name === null;
-      document.getElementById("my-name").textContent = me.name;
+      document.getElementById("my-name").textContent = me.name || "Guest";
 
       // A share can be bought while betting is open, if we can afford its price.
       for (const buyButton of document.querySelectorAll(".side button")) {
@@ -122,16 +189,17 @@
         buyButton.disabled = !game.betting_open || price > me.points;
       }
 
+      // The status line: what is happening on the left, and the countdown on the right.
+      let status = "Waiting for the first drop";
       if (game.dropping) {
-        message.textContent = game.betting_open ? "Betting is open" : "Betting closed";
-      } else {
-        let text = `Next drop in ${Math.ceil(game.seconds_to_drop)}`;
-        if (game.last_bucket) {
-          const sign = me.last_won > 0 ? "+" : "";
-          text = `Landed ${game.last_bucket}: ${sign}${me.last_won} points. ` + text;
-        }
-        message.textContent = text;
+        status = game.betting_open ? "Betting open" : "Betting closed";
+      } else if (game.last_bucket) {
+        const sign = me.last_won > 0 ? "+" : "";
+        status = `Landed ${game.last_bucket} · ${sign}${me.last_won} points`;
       }
+      document.getElementById("status").textContent = status;
+      document.getElementById("countdown").textContent =
+        game.dropping ? "" : `Next drop in ${Math.ceil(game.seconds_to_drop)}s`;
     }
 
     // Each plus button asks the server to buy one share on its side at the current price.
@@ -171,7 +239,12 @@
     function showLeaderboard() {
       const rows = leaderboard.map((entry) => {
         const row = document.createElement("li");
-        row.textContent = `${entry.name}: ${entry.points}`;
+        const name = document.createElement("span");
+        const points = document.createElement("span");
+        name.textContent = entry.name;
+        points.textContent = entry.points;
+        points.className = "points";
+        row.append(name, points);
         if (me && entry.name === me.name) row.className = "me";
         return row;
       });
