@@ -116,9 +116,6 @@ game = {
     "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
     "buys": [],  # every player buy this round, in order, for the round log. See buy()
     "last_bucket": None,  # where the previous ball landed
-    # How many balls have landed in each bucket: the logged rounds in the database (see
-    # load_landed()), plus every ball since the server started.
-    "landed": {"left": 0, "right": 0},
     "ranking": [],  # every named player, most points first, as [{"name": ..., "points": ...}], made from named_points
     "positions": {},  # each name's index in "ranking", so a player can be found quickly
     "minus_points": [],  # minus each player's points, in "ranking" order, so it ascends for bisect
@@ -456,7 +453,6 @@ def settle():
 
     game["shares"] = {"left": 0, "right": 0}
     game["last_bucket"] = bucket
-    game["landed"][bucket] += 1
     for row in rows:
         named_points[row["name"]] = row["points"]
     for queue, player_id in streams.items():
@@ -628,34 +624,6 @@ async def save_round_logs():
             await asyncio.sleep(30)
 
 
-async def load_landed():
-    """Start the "past X drops" tally from the round log, once, when the server starts, so it
-    carries on from before a restart instead of starting again from nothing.
-
-    The tally then counts every ball that lands, but the log only has the rounds somebody
-    bought in. So after a restart the tally steps back by the rounds nobody played. And once
-    the log is long, the database answers with its own quick estimate of the count, not an
-    exact one. Neither matters for a tally whose point is "about half each".
-    If the database can't be reached, we keep trying every 30 seconds, like load_ranking().
-    """
-    while True:
-        counts = {}
-        try:
-            for side in ("left", "right"):
-                # A HEAD request asks for no rows, only how many there are, which comes back
-                # in a header that looks like "0-9/1234" or "*/1234".
-                response = await db.head("/rounds", params={"bucket": "eq." + side}, headers={"Prefer": "count=estimated"})
-                response.raise_for_status()
-                counts[side] = int(response.headers["Content-Range"].split("/")[1])
-        except (httpx.HTTPError, KeyError, ValueError, IndexError) as error:
-            print("Could not load the tally of past drops, trying again in 30 seconds:", repr(error))
-            await asyncio.sleep(30)
-            continue
-        for side, count in counts.items():
-            game["landed"][side] += count  # added, not set: balls may have landed while we were asking
-        return
-
-
 async def run_rounds():
     """The round loop: wait for the countdown, drop a ball, wait for it to land, pay out. Forever."""
     while True:
@@ -750,7 +718,6 @@ async def broadcast():
             "betting_open": betting_open(),
             "online": len(streams),
             "last_bucket": game["last_bucket"],
-            "landed": game["landed"],
         }
         if dropping:
             # The positions the pages don't have yet, and the frame number of the first of them.
@@ -910,10 +877,10 @@ async def reset_points(request):
 
 @contextlib.asynccontextmanager
 async def lifespan(app):
-    """When the server starts: load the leaderboard and the tally of past drops, and start the
-    round loop, the broadcaster and the saving of the round log.
+    """When the server starts: load the leaderboard, and start the round loop, the broadcaster
+    and the saving of the round log.
     The game starts straight away, even if the leaderboard takes a few tries to load."""
-    jobs = [load_ranking(), load_landed(), run_rounds(), broadcast(), save_round_logs()]
+    jobs = [load_ranking(), run_rounds(), broadcast(), save_round_logs()]
     tasks = [asyncio.create_task(job) for job in jobs]
     yield
     for task in tasks:

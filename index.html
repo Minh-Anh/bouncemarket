@@ -34,13 +34,30 @@
     .muted { color: var(--muted); font-size: 13px; }
     .panel { background: var(--panel); border-radius: 12px; padding: 12px 14px; }
 
-    /* Top bar: the title, and the countdown to the next drop on the same line. The bar copies the
-       layout of the two columns below (same widths, gap and wrapping), so its first part is exactly
-       as wide as the game column and the countdown's right edge lines up with the board's. */
+    /* Top bar: the title, then on the same line the countdown to the next drop and how many
+       players are online, and at the far right a credit. The bar copies the layout of the two
+       columns below (same widths, gap and wrapping), so its first part is exactly as wide as the
+       game column, with the notes' right edge lined up with the board's, and the credit sits
+       above the sidebar. */
     #page { max-width: 760px; margin: 0 auto; padding: 0 16px 24px; }
-    header { display: flex; flex-wrap: wrap; justify-content: center; column-gap: 20px; padding: 12px 0; }
-    #title-row { flex: 0 1 400px; display: flex; justify-content: space-between; align-items: baseline; }
-    #header-spacer { flex: 1 1 260px; }  /* stands in for the sidebar; empty */
+    header { display: flex; flex-wrap: wrap; justify-content: center; align-items: baseline; column-gap: 20px; padding: 12px 0; }
+    #title-row { flex: 0 1 400px; display: flex; justify-content: space-between; align-items: baseline; column-gap: 12px; }
+    /* The notes never wrap onto a second line, which would make the page jump every time the
+       countdown appeared. If they ever don't fit, the end is cut off with "…" instead. */
+    #header-notes { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* A dot between the countdown and how many are online, only while there is a countdown. */
+    #countdown:not(:empty)::after { content: "\00a0·\00a0"; }
+    #header-side { flex: 1 1 260px; text-align: right; }  /* as wide as the sidebar, which it sits above */
+    .credit { color: var(--muted); font-size: 13px; text-decoration: none; }
+    .credit:hover { color: var(--text); text-decoration: underline; }
+    /* When the screen is too narrow for two columns, the sidebar wraps under the game. The credit
+       then moves to the bottom of the page, where it doesn't push the board down. 711px is the
+       widest screen that can't fit both columns: 400 + 20 + 260, and 16 of padding each side. */
+    #credit-bottom { display: none; }
+    @media (max-width: 711px) {
+      #header-side { display: none; }
+      #credit-bottom { display: block; }
+    }
 
     /* Two columns side by side: the game, then the leaderboard taking the space that is left.
        On a narrow screen the leaderboard doesn't fit beside the game, so it wraps underneath. */
@@ -57,7 +74,6 @@
     /* The two halves sit on one line when there is room, and stack on a narrow phone. */
     #status-line { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; column-gap: 12px; font-size: 17px; }
     #status { font-weight: bold; color: var(--accent); }
-    #countdown { color: var(--muted); }
     #balance { font-weight: bold; }
 
     /* One card per side, stacked: its name, its price per share, our holding, and a buy button across the bottom. */
@@ -82,7 +98,7 @@
     #odds-left { background: var(--left); border-radius: 4px 0 0 4px; }
     #odds-right { background: var(--right); border-radius: 0 4px 4px 0; }
 
-    /* Panel headings, with a note (how many are online, whether odds are live) pushed to the right. */
+    /* Panel headings, with a note (that trading has closed, on the market odds) pushed to the right. */
     .panel-head { display: flex; justify-content: space-between; align-items: baseline; }
 
     #name { width: 100%; font: inherit; padding: 6px 10px; border-radius: 8px; border: none; margin-bottom: 8px; }
@@ -127,9 +143,9 @@
   <header>
     <div id="title-row">
       <h1>bouncemarket</h1>
-      <span id="countdown"></span>
+      <span class="muted" id="header-notes"><span id="countdown"></span><span id="online"></span></span>
     </div>
-    <div id="header-spacer"></div>
+    <div id="header-side"><a class="credit" href="https://minhanhday.com/code" target="_blank" rel="noopener">created by minh-anh day</a></div>
   </header>
 
   <main>
@@ -173,11 +189,10 @@
       <div class="panel">
         <div class="panel-head">
           <h2>leaderboard</h2>
-          <span class="muted"><span id="online"></span> online</span>
         </div>
         <ol id="leaderboard"></ol>
       </div>
-      <p class="muted" id="tally"></p>
+      <p id="credit-bottom"><a class="credit" href="https://minhanhday.com/code" target="_blank" rel="noopener">created by minh-anh day</a></p>
     </section>
   </main>
 </div>
@@ -320,12 +335,7 @@
     // Show everything except the ball, from the latest public and private messages.
     function render() {
       if (!game || !me) return;
-      document.getElementById("online").textContent = game.online;
-      const { left, right } = game.landed;
-      const drops = left + right;
-      document.getElementById("tally").textContent = drops === 0
-        ? "no drops yet"
-        : `past ${drops} ${drops === 1 ? "drop" : "drops"} · ${left} left, ${right} right`;
+      document.getElementById("online").textContent = `${game.online} online`;  // everyone with the page open, us included
 
       // A share can be bought while betting is open, if we can afford its price.
       for (const buyButton of document.querySelectorAll(".side button")) {
@@ -348,8 +358,7 @@
       rightBar.style.flexGrow = rightPercent;
       leftBar.title = `left: ${leftPercent}% chance, ${game.prices.left.toFixed(2)} per share`;
       rightBar.title = `right: ${rightPercent}% chance, ${game.prices.right.toFixed(2)} per share`;
-      document.getElementById("odds-status").textContent =
-        !game.dropping ? "even until the drop" : game.betting_open ? "live" : "trading closed";
+      document.getElementById("odds-status").textContent = game.dropping && !game.betting_open ? "trading closed" : "";
 
       // The status line: what is happening on the left, and our balance on the right.
       let status = "waiting for the first drop";

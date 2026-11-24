@@ -72,8 +72,6 @@ If the database can't be reached, the game carries on: everyone can still play, 
 
 Players without a name live only in the server's memory, and lose their points when it restarts. Once you claim a name, your id, name and points are a row in the Supabase `players` table. The server saves your points there after every round you play in, and loads them back the next time your browser connects.
 
-The "past X drops" tally also survives a restart, roughly: when the server starts, it counts the rounds in the round log (below), then adds every ball that lands. The log only has the rounds somebody bought in, so after a restart the tally steps back by the rounds nobody played, and once the log is long the database answers with an estimate, not an exact count.
-
 ## The round log
 
 Every round that at least one player bought in is saved to the database, for analysis later: how well the market's odds track the real ones, and how players differ in the way they play. Rounds nobody bought in aren't saved.
