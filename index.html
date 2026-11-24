@@ -193,7 +193,7 @@
 
   <dialog id="reset-dialog">
     <h2>Reset your points?</h2>
-    <p>You'll go from <span id="reset-points"></span> back to 10 points. This can't be undone.</p>
+    <p>You'll go from <span id="reset-points"></span> back to 10.00 points. This can't be undone.</p>
     <p class="muted" id="reset-error"></p>
     <div class="dialog-buttons">
       <button type="button" id="reset-cancel">Cancel</button>
@@ -205,6 +205,7 @@
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
     const FPS = 60;  // the ball moves one frame every 1/60 second
+    const BALL_DRAW_SCALE = 1.5;  // how much bigger the ball is drawn than the physics ball; only the picture changes
     const FADE_RATE = 4;  // how sharp the landing highlight's fade is: higher makes the start and end quicker and the middle flatter
     let board;
     let game = null;  // the latest public message: the state of the shared game
@@ -259,6 +260,9 @@
         polygon(bucket, "#fc3");
         ctx.globalAlpha = 1;
       }
+      // The ball is drawn bigger than the one in the physics, so it's easy to see on a phone. It goes
+      // under the walls and pins, so where it overlaps them it looks tucked behind, not sunk into them.
+      if (ball) circle(ball[0], ball[1], board.ball_r * BALL_DRAW_SCALE, "#fc3");
       ctx.strokeStyle = "#888";
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -270,7 +274,6 @@
       ctx.lineTo(mid, h);
       ctx.stroke();
       for (const [x, y] of board.pins) circle(x, y, board.pin_r, "#888");
-      if (ball) circle(ball[0], ball[1], board.ball_r, "#fc3");
     }
 
     // Show everything except the ball, from the latest public and private messages.
@@ -314,7 +317,7 @@
         status = game.betting_open ? "Trading open" : "Trading closed";
       } else if (game.last_bucket) {
         const sign = me.last_won > 0 ? "+" : "";
-        status = `Landed ${game.last_bucket} · ${sign}${me.last_won} points`;
+        status = `Landed ${game.last_bucket} · ${sign}${me.last_won.toFixed(2)} points`;
       }
       document.getElementById("status").textContent = status;
       showCountdown();
@@ -346,7 +349,7 @@
     // The reset dialog: start over with 10 points, after saying yes.
     const resetDialog = document.getElementById("reset-dialog");
     function openResetDialog() {
-      document.getElementById("reset-points").textContent = me.points;
+      document.getElementById("reset-points").textContent = me.points.toFixed(2);
       document.getElementById("reset-error").textContent = "";
       resetDialog.showModal();
     }
@@ -400,7 +403,7 @@
         const name = document.createElement("span");
         const points = document.createElement("span");
         name.textContent = entry.name ?? "you";  // we're ranked even before claiming a name
-        points.textContent = entry.points;
+        points.textContent = entry.points.toFixed(2);  // always two decimal places, e.g. 10.00
         points.className = "points";
         row.append(name);
         if (entry.me) {

@@ -32,7 +32,7 @@ WALL_LENGTH = math.hypot(WALL_SLANT, HEIGHT)
 # Physics. Gravity and bounce can be set on the command line, e.g. --bounce 0.3
 parser = argparse.ArgumentParser()
 parser.add_argument("--gravity", type=float, default=400, help="pixels / second^2")
-parser.add_argument("--bounce", type=float, default=0.8, help="fraction of speed kept after hitting something, 0 to 1")
+parser.add_argument("--bounce", type=float, default=0.85, help="fraction of speed kept after hitting something, 0 to 1")
 args = parser.parse_args()
 GRAVITY = args.gravity
 BOUNCE = args.bounce
