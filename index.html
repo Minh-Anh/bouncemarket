@@ -30,10 +30,9 @@
     .muted { color: var(--muted); font-size: 13px; }
     .panel { background: var(--panel); border-radius: 12px; padding: 12px 14px; }
 
-    /* Top bar: the title on the left, this player's name and points on the right. */
+    /* Top bar: just the title. */
     #page { max-width: 760px; margin: 0 auto; padding: 0 16px 24px; }
-    header { display: flex; justify-content: space-between; align-items: baseline; padding: 12px 0; }
-    #points { font-size: 18px; font-weight: bold; color: var(--accent); }
+    header { padding: 12px 0; }
 
     /* Two columns side by side: the game, then the leaderboard taking the space that is left.
        On a narrow screen the leaderboard doesn't fit beside the game, so it wraps underneath. */
@@ -76,11 +75,14 @@
     /* Panel headings, with a note (how many are online, whether odds are live) pushed to the right. */
     .panel-head { display: flex; justify-content: space-between; align-items: baseline; }
 
-    #claim { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-    #name, #claim button { font: inherit; padding: 6px 10px; border-radius: 8px; border: none; }
-    #name { flex: 1; min-width: 0; }
-    #claim button { background: var(--accent); color: #111; font-weight: bold; cursor: pointer; }
-    #claim-error { width: 100%; }
+    #name { width: 100%; font: inherit; padding: 6px 10px; border-radius: 8px; border: none; margin-bottom: 8px; }
+
+    /* The "Claim name" button on a guest's own leaderboard row, after "you". */
+    #leaderboard .claim-button {
+      margin-left: 8px; padding: 1px 8px; border: 1px solid var(--accent); border-radius: 6px;
+      font: inherit; font-size: 12px; background: none; color: var(--accent); cursor: pointer;
+    }
+    #leaderboard .claim-button:hover { background: var(--accent); color: #111; }
 
     /* Each row: its rank (added by the browser), the name, and the points pushed to the right. */
     #leaderboard { margin: 8px 0 0; padding-left: 24px; }
@@ -101,8 +103,8 @@
     dialog p { margin-bottom: 8px; }
     .dialog-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
     .dialog-buttons button { font: inherit; padding: 6px 12px; border: none; border-radius: 8px; cursor: pointer; }
-    #reset-cancel { background: #333; color: var(--text); }
-    #reset-confirm { background: var(--accent); color: #111; font-weight: bold; }
+    #reset-cancel, #claim-cancel { background: #333; color: var(--text); }
+    #reset-confirm, #claim-confirm { background: var(--accent); color: #111; font-weight: bold; }
 
     #leaderboard .gap { list-style: none; color: var(--muted); }  /* the "…" between the top 10 and the rows around you */
   </style>
@@ -111,7 +113,6 @@
 <div id="page">
   <header>
     <h1>bouncemarket</h1>
-    <p><span class="muted" id="my-name"></span> &nbsp;<span id="points"></span> <span class="muted">points</span></p>
   </header>
 
   <main>
@@ -157,12 +158,6 @@
           <h2>Leaderboard</h2>
           <span class="muted"><span id="online"></span> online</span>
         </div>
-        <!-- Shown until this player has claimed a name. -->
-        <form id="claim" hidden>
-          <input id="name" maxlength="16" placeholder="Your name" autocomplete="off">
-          <button>Join</button>
-          <p class="muted" id="claim-error"></p>
-        </form>
         <ol id="leaderboard"></ol>
       </div>
       <p class="muted" id="tally"></p>
@@ -179,6 +174,20 @@
       </svg>
     </button>
   </template>
+
+  <!-- Opened from the "Claim name" button on a guest's own leaderboard row. -->
+  <dialog id="claim-dialog">
+    <h2>Set a username</h2>
+    <p>Your username goes on the leaderboard, and your points are saved from then on. Usernames can't be changed later.</p>
+    <form id="claim">
+      <input id="name" maxlength="16" placeholder="Your name" autocomplete="off">
+      <p class="muted" id="claim-error"></p>
+      <div class="dialog-buttons">
+        <button type="button" id="claim-cancel">Cancel</button>
+        <button id="claim-confirm">Set username</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="reset-dialog">
     <h2>Reset your points?</h2>
@@ -265,7 +274,6 @@
     // Show everything except the ball, from the latest public and private messages.
     function render() {
       if (!game || !me) return;
-      document.getElementById("points").textContent = me.points;
       document.getElementById("online").textContent = game.online;
       const { left, right } = game.landed;
       const drops = left + right;
@@ -273,9 +281,6 @@
         ? "No drops yet"
         : `Past ${drops} ${drops === 1 ? "drop" : "drops"} · ${left} left, ${right} right`;
 
-      // Offer the name form until we have a name, then show the name instead.
-      document.getElementById("claim").hidden = me.name !== null;
-      document.getElementById("my-name").textContent = me.name || "Guest";
 
       // A share can be bought while betting is open, if we can afford its price.
       for (const buyButton of document.querySelectorAll(".side button")) {
@@ -299,12 +304,12 @@
       leftBar.title = `Left: ${leftPercent}% chance, ${game.prices.left.toFixed(2)} per share`;
       rightBar.title = `Right: ${rightPercent}% chance, ${game.prices.right.toFixed(2)} per share`;
       document.getElementById("odds-status").textContent =
-        !game.dropping ? "Even until the drop" : game.betting_open ? "Live" : "Betting closed";
+        !game.dropping ? "Even until the drop" : game.betting_open ? "Live" : "Trading closed";
 
       // The status line: what is happening on the left, and the countdown on the right.
       let status = "Waiting for the first drop";
       if (game.dropping) {
-        status = game.betting_open ? "Betting open" : "Betting closed";
+        status = game.betting_open ? "Trading open" : "Trading closed";
       } else if (game.last_bucket) {
         const sign = me.last_won > 0 ? "+" : "";
         status = `Landed ${game.last_bucket} · ${sign}${me.last_won} points`;
@@ -360,7 +365,13 @@
       }
     };
 
-    // Claim a name, which puts us on the leaderboard.
+    // The claim dialog: pick a name, which puts it on the leaderboard in place of "you".
+    const claimDialog = document.getElementById("claim-dialog");
+    function openClaimDialog() {
+      document.getElementById("claim-error").textContent = "";
+      claimDialog.showModal();
+    }
+    document.getElementById("claim-cancel").onclick = () => claimDialog.close();
     document.getElementById("claim").onsubmit = async (event) => {
       event.preventDefault();  // stop the browser reloading the page, its default for forms
       const response = await fetch("/name", {
@@ -372,7 +383,8 @@
       if (response.ok) {
         me = result;
         render();
-        showLeaderboard();  // to highlight our new name
+        claimDialog.close();
+        // The server sends everyone a new leaderboard with our name in it.
       } else {
         document.getElementById("claim-error").textContent = result.error;
       }
@@ -385,16 +397,26 @@
         row.value = entry.rank;  // the number the list shows, so the rows around us show e.g. 45 to 49
         const name = document.createElement("span");
         const points = document.createElement("span");
-        name.textContent = entry.name;
+        name.textContent = entry.name ?? "you";  // we're ranked even before claiming a name
         points.textContent = entry.points;
         points.className = "points";
         row.append(name);
-        if (me && entry.name === me.name) {
+        if (entry.me) {
           row.className = "me";
-          // Our own row gets a small reset button just left of the points, which asks before doing anything.
-          const reset = document.getElementById("reset-icon").content.firstElementChild.cloneNode(true);
-          reset.onclick = openResetDialog;
-          points.prepend(reset);
+          if (entry.name === null) {
+            // Without a name, a button after "you" to claim one.
+            const claim = document.createElement("button");
+            claim.type = "button";
+            claim.className = "claim-button";
+            claim.textContent = "set username";
+            claim.onclick = openClaimDialog;
+            row.append(claim);
+          } else {
+            // With a name, a small reset button just left of the points, which asks before doing anything.
+            const reset = document.getElementById("reset-icon").content.firstElementChild.cloneNode(true);
+            reset.onclick = openResetDialog;
+            points.prepend(reset);
+          }
         }
         row.append(points);
         return row;

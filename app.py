@@ -3,6 +3,7 @@
 # ///
 import argparse
 import asyncio
+import bisect
 import contextlib
 import json
 import math
@@ -109,6 +110,7 @@ game = {
     "landed": {"left": 0, "right": 0},  # how many balls have landed in each bucket
     "ranking": [],  # every named player, most points first, as [{"name": ..., "points": ...}], made from named_points
     "positions": {},  # each name's index in "ranking", so a player can be found quickly
+    "minus_points": [],  # minus each player's points, in "ranking" order, so it ascends for bisect
 }
 
 # One entry per player who has opened the page since the server started, keyed by the
@@ -240,6 +242,7 @@ def publish_leaderboard():
     ranking.sort(key=lambda row: (-row["points"], row["name"]))
     game["ranking"] = ranking
     game["positions"] = {row["name"]: i for i, row in enumerate(ranking)}
+    game["minus_points"] = [-row["points"] for row in ranking]  # ascending, for finding where a guest fits
     for queue, player_id in streams.items():
         send(queue, leaderboard_message(players[player_id]))
 
@@ -247,16 +250,34 @@ def publish_leaderboard():
 def leaderboard_message(player):
     """The leaderboard as one player sees it: the top LEADERBOARD_SIZE players and, if this
     player is ranked below them, the NEIGHBORS players either side of them as well.
-    Every row carries its rank, counting from 1."""
+    Every row carries its rank, counting from 1, and the player's own row is marked "me".
+
+    Everyone is ranked, named or not. A guest (or a named player not in the ranking yet) is
+    slotted in where their points would put them, after anyone with the same points, and
+    the players below them move down one, just for them. Other guests are never shown.
+    """
     ranking = game["ranking"]
+    my_position = game["positions"].get(player["name"])
+    slotted_in = my_position is None
+    if slotted_in:
+        my_position = bisect.bisect_right(game["minus_points"], -player["points"])
+        mine = {"name": player["name"], "points": player["points"]}
+    total = len(ranking) + slotted_in
+
+    def row(i):
+        """The row at index i of the ranking as this player sees it."""
+        if slotted_in and i == my_position:
+            entry = mine
+        else:
+            entry = ranking[i - 1 if slotted_in and i > my_position else i]
+        return {"rank": i + 1, **entry, **({"me": True} if i == my_position else {})}
 
     def rows(start, end):
-        return [{"rank": i + 1, **ranking[i]} for i in range(start, min(end, len(ranking)))]
+        return [row(i) for i in range(start, min(end, total))]
 
     around_me = []
-    position = game["positions"].get(player["name"])
-    if position is not None and position >= LEADERBOARD_SIZE:
-        around_me = rows(max(LEADERBOARD_SIZE, position - NEIGHBORS), position + NEIGHBORS + 1)
+    if my_position >= LEADERBOARD_SIZE:
+        around_me = rows(max(LEADERBOARD_SIZE, my_position - NEIGHBORS), my_position + NEIGHBORS + 1)
     return sse("leaderboard", {"top": rows(0, LEADERBOARD_SIZE), "around_me": around_me})
 
 
@@ -548,7 +569,7 @@ async def buy(request):
     if player is None:
         return JSONResponse({"error": "Unknown player."}, status_code=400)
     if not betting_open():
-        return JSONResponse({"error": "Betting is closed."}, status_code=400)
+        return JSONResponse({"error": "Trading is closed."}, status_code=400)
     price = prices()[side]
     if price > player["points"]:
         return JSONResponse({"error": "You don't have enough points."}, status_code=400)
