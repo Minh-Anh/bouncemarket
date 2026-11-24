@@ -45,6 +45,7 @@
     /* The board shrinks to fit a small screen, keeping its shape, and never takes more than
        half the screen's height, so the buy buttons stay in view below it. */
     #board { padding: 20px; }  /* space around the box, so it floats inside the panel */
+    @media (max-width: 500px) { #board { padding: 10px; } }  /* on a phone, give that space to the board instead */
     canvas { display: block; margin: 0 auto; max-width: 100%; max-height: 50dvh; }
 
     /* The two halves sit on one line when there is room, and stack on a narrow phone. */
@@ -206,6 +207,8 @@
     const ctx = canvas.getContext("2d");
     const FPS = 60;  // the ball moves one frame every 1/60 second
     const BALL_DRAW_SCALE = 1.5;  // how much bigger the ball is drawn than the physics ball; only the picture changes
+    const BALL_GLOW = 20;  // how far the ball's soft yellow glow spreads, in canvas pixels; 0 for none
+    const BALL_GLOW_LAYERS = 2;  // how many times the glow is stacked; each layer makes it brighter
     const FADE_RATE = 4;  // how sharp the landing highlight's fade is: higher makes the start and end quicker and the middle flatter
     let board;
     let game = null;  // the latest public message: the state of the shared game
@@ -262,7 +265,15 @@
       }
       // The ball is drawn bigger than the one in the physics, so it's easy to see on a phone. It goes
       // under the walls and pins, so where it overlaps them it looks tucked behind, not sunk into them.
-      if (ball) circle(ball[0], ball[1], board.ball_r * BALL_DRAW_SCALE, "#fc3");
+      if (ball) {
+        // A soft yellow glow makes the ball easy to spot without drawing it any bigger.
+        ctx.shadowColor = "rgba(255, 204, 51, 0.8)";
+        ctx.shadowBlur = BALL_GLOW;
+        for (let layer = 0; layer < BALL_GLOW_LAYERS; layer++) {
+          circle(ball[0], ball[1], board.ball_r * BALL_DRAW_SCALE, "#fc3");
+        }
+        ctx.shadowBlur = 0;  // nothing else glows
+      }
       ctx.strokeStyle = "#888";
       ctx.lineWidth = 2;
       ctx.beginPath();
