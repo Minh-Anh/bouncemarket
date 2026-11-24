@@ -43,7 +43,9 @@ BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the pag
 COUNTERPARTY_BUY_FRAMES = 30  # the counterparty buys every 30 frames, which is 0.5 seconds
 COUNTDOWN_SECONDS = 5  # the wait between one ball landing and the next one dropping
 LEADERBOARD_SIZE = 10
-SEED_SHARES = 2  # pretend shares on each side, so the price starts at 0.50 and early buys move it gently
+NEIGHBORS = 2  # a player ranked below the top 10 also sees this many players either side of them
+PAGE_SIZE = 1000  # the most rows Supabase returns from one request, unless its settings say otherwise
+SEED_SHARES = 1  # pretend shares on each side, so the price starts at 0.50. Fewer makes early buys swing it harder
 
 
 def wall_inset(y):
@@ -97,7 +99,8 @@ game = {
     "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
     "last_bucket": None,  # where the previous ball landed
     "landed": {"left": 0, "right": 0},  # how many balls have landed in each bucket
-    "leaderboard": [],  # the named players with the most points, as [{"name": ..., "points": ...}]
+    "ranking": [],  # every named player, most points first, as [{"name": ..., "points": ...}]
+    "positions": {},  # each name's index in "ranking", so a player can be found quickly
 }
 
 # One entry per player who has opened the page since the server started, keyed by the
@@ -189,17 +192,46 @@ async def save_players(rows):
 
 
 async def refresh_leaderboard():
-    """Fetch the top named players from the database and send the list to every page."""
-    params = {"select": "name,points", "order": "points.desc", "limit": LEADERBOARD_SIZE}
+    """Fetch every named player from the database, best first, and send each page its leaderboard.
+
+    We need everyone, not just the top few, so we can tell a player ranked 47th who is
+    around them. The database hands rows over at most PAGE_SIZE at a time, so we ask
+    page by page. That is one small request per round for the first thousand players.
+    Players with the same points are ranked by name, so the order never shuffles.
+    """
+    ranking = []
     try:
-        response = await db.get("/players", params=params)
-        response.raise_for_status()
+        while True:
+            params = {"select": "name,points", "order": "points.desc,name.asc", "limit": PAGE_SIZE, "offset": len(ranking)}
+            response = await db.get("/players", params=params)
+            response.raise_for_status()
+            page = response.json()
+            ranking += page
+            if len(page) < PAGE_SIZE:
+                break
     except httpx.HTTPError as error:
         print("Could not load the leaderboard:", repr(error))  # keep showing the last one we got
         return
-    game["leaderboard"] = response.json()
-    for queue in streams:
-        send(queue, sse("leaderboard", game["leaderboard"]))
+    game["ranking"] = ranking
+    game["positions"] = {row["name"]: i for i, row in enumerate(ranking)}
+    for queue, player_id in streams.items():
+        send(queue, leaderboard_message(players[player_id]))
+
+
+def leaderboard_message(player):
+    """The leaderboard as one player sees it: the top LEADERBOARD_SIZE players and, if this
+    player is ranked below them, the NEIGHBORS players either side of them as well.
+    Every row carries its rank, counting from 1."""
+    ranking = game["ranking"]
+
+    def rows(start, end):
+        return [{"rank": i + 1, **ranking[i]} for i in range(start, min(end, len(ranking)))]
+
+    around_me = []
+    position = game["positions"].get(player["name"])
+    if position is not None and position >= LEADERBOARD_SIZE:
+        around_me = rows(max(LEADERBOARD_SIZE, position - NEIGHBORS), position + NEIGHBORS + 1)
+    return sse("leaderboard", {"top": rows(0, LEADERBOARD_SIZE), "around_me": around_me})
 
 
 async def get_player(player_id):
@@ -395,8 +427,9 @@ async def events(request):
     """Stream messages to one player's page for as long as it stays open.
 
     The page gets a private "me" message (its name, points and shares) when it connects and
-    after each round, the public "game" message from broadcast(), and a "leaderboard"
-    message when it connects and whenever the leaderboard is refreshed.
+    after each round, the public "game" message from broadcast(), and its own "leaderboard"
+    message (the top players, plus the players around it) when it connects and whenever the
+    leaderboard is refreshed.
     """
     player_id = parse_id(request.query_params["player"])
     if player_id is None:
@@ -408,7 +441,7 @@ async def events(request):
         streams[queue] = player_id
         try:
             yield sse("me", player)
-            yield sse("leaderboard", game["leaderboard"])
+            yield leaderboard_message(player)
             while True:
                 yield await queue.get()
         finally:

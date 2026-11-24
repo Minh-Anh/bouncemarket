@@ -6,14 +6,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>bouncemarket</title>
   <style>
-    /* The whole palette: yellow as the accent, deep purple for the buy buttons, and three greys. */
+    /* The whole palette: yellow as the accent, blue for the left side and orange for the right
+       (the buy buttons and the odds bar), and three greys. */
     :root {
       --background: #111;
       --panel: #1c1c1c;
       --text: #eee;
       --muted: #999;
       --accent: #fc3;
-      --buy: #5b21b6;
+      --left: #3987e5;
+      --right: #d95926;
     }
     * { box-sizing: border-box; }
     [hidden] { display: none !important; }  /* without this, a display rule below would un-hide a hidden element */
@@ -49,17 +51,30 @@
     #status { font-weight: bold; color: var(--accent); }
     #countdown { color: var(--muted); }
 
-    /* One panel per side: its price and our holding on the left, its buy button on the right. */
+    /* One card per side, stacked: its name, its price per share, our holding, and a buy button across the bottom. */
     #market { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .side { display: flex; justify-content: space-between; align-items: center; }
+    .side { display: grid; gap: 4px; }
     .price { font-size: 30px; font-weight: bold; line-height: 1.2; }
     .side button {
-      width: 56px; height: 56px; border: none; border-radius: 50%;
-      font-size: 32px; font-weight: bold; color: var(--text); background: var(--buy); cursor: pointer;
+      margin-top: 6px; padding: 10px 6px; border: none; border-radius: 8px;
+      font: inherit; font-weight: bold; color: #111; cursor: pointer;  /* dark text reads better than white on both colors */
       touch-action: manipulation;  /* stops a quick double tap from zooming the page */
     }
-    .side button:active { transform: scale(0.9); }
+    .side button:active { transform: scale(0.97); }
+    #left-side button { background: var(--left); }
+    #right-side button { background: var(--right); }
     .side button:disabled { opacity: 0.3; cursor: default; }
+
+    /* Market odds: each side's share price is the chance the market gives it, shown as a split bar.
+       Blue and orange are a validated colorblind-safe pair; the percentages label each side too. */
+    #odds-labels { display: flex; justify-content: space-between; margin-top: 8px; font-size: 17px; font-weight: bold; }
+    #odds-bar { display: flex; gap: 2px; height: 10px; margin-top: 6px; }
+    #odds-bar div { transition: flex-grow 0.3s; min-width: 4px; }
+    #odds-left { background: var(--left); border-radius: 4px 0 0 4px; }
+    #odds-right { background: var(--right); border-radius: 0 4px 4px 0; }
+
+    /* Panel headings, with a note (how many are online, whether odds are live) pushed to the right. */
+    .panel-head { display: flex; justify-content: space-between; align-items: baseline; }
 
     #claim { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
     #name, #claim button { font: inherit; padding: 6px 10px; border-radius: 8px; border: none; }
@@ -69,9 +84,10 @@
 
     /* Each row: its rank (added by the browser), the name, and the points pushed to the right. */
     #leaderboard { margin: 8px 0 0; padding-left: 24px; }
-    #leaderboard li { padding: 3px 0; }
+    #leaderboard li { padding: 3px 0; text-transform: lowercase; }  /* names are stored as typed, shown in lowercase */
     #leaderboard .points { float: right; font-weight: bold; }
     #leaderboard .me { color: var(--accent); }
+    #leaderboard .gap { list-style: none; color: var(--muted); }  /* the "…" between the top 10 and the rows around you */
   </style>
 </head>
 <body>
@@ -92,29 +108,38 @@
 
       <div id="market">
         <div class="side panel" id="left-side">
-          <div>
-            <p class="label">Left</p>
-            <p class="price" id="price-left"></p>
-            <p class="muted">You hold <span id="shares-left">0</span></p>
-          </div>
-          <button data-side="left">+</button>
+          <p class="label">Left</p>
+          <p class="muted">Price per share</p>
+          <p class="price" id="price-left"></p>
+          <p class="muted">You hold <span id="shares-left">0</span></p>
+          <button data-side="left">Buy 1 share</button>
         </div>
         <div class="side panel" id="right-side">
-          <div>
-            <p class="label">Right</p>
-            <p class="price" id="price-right"></p>
-            <p class="muted">You hold <span id="shares-right">0</span></p>
-          </div>
-          <button data-side="right">+</button>
+          <p class="label">Right</p>
+          <p class="muted">Price per share</p>
+          <p class="price" id="price-right"></p>
+          <p class="muted">You hold <span id="shares-right">0</span></p>
+          <button data-side="right">Buy 1 share</button>
         </div>
       </div>
 
-      <p class="muted">+ buys one share at the price shown. A share pays 1 point if the ball lands on its side.</p>
+      <p class="muted">Each winning share pays 1 point.</p>
     </section>
 
     <section id="sidebar">
       <div class="panel">
-        <h2>Leaderboard</h2>
+        <div class="panel-head">
+          <h2>Market odds</h2>
+          <span class="muted" id="odds-status"></span>
+        </div>
+        <div id="odds-labels"><span id="odds-left-label"></span><span id="odds-right-label"></span></div>
+        <div id="odds-bar"><div id="odds-left"></div><div id="odds-right"></div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Leaderboard</h2>
+          <span class="muted"><span id="online"></span> online</span>
+        </div>
         <!-- Shown until this player has claimed a name. -->
         <form id="claim" hidden>
           <input id="name" maxlength="16" placeholder="Your name" autocomplete="off">
@@ -123,10 +148,7 @@
         </form>
         <ol id="leaderboard"></ol>
       </div>
-      <p class="muted">
-        Landed left <span id="left"></span> · right <span id="right"></span>
-        &nbsp;·&nbsp; <span id="online"></span> online
-      </p>
+      <p class="muted" id="tally"></p>
     </section>
   </main>
 </div>
@@ -139,7 +161,7 @@
     let board;
     let game = null;  // the latest public message: the state of the shared game
     let me = null;  // the latest private message: this player's name, points and shares
-    let leaderboard = [];  // the latest leaderboard message: the top players' names and points
+    let leaderboard = { top: [], around_me: [] };  // the latest leaderboard message: the top players, and the players around us if we're below them
     let queue = [];  // ball positions waiting until their frame is due, each [frame, x, y]
     let dropStart = null;  // on our clock, the moment the ball dropped
     let dropsAt = null;  // on our clock, the moment the next ball will drop (only between drops)
@@ -207,9 +229,12 @@
     function render() {
       if (!game || !me) return;
       document.getElementById("points").textContent = me.points;
-      document.getElementById("left").textContent = game.landed.left;
-      document.getElementById("right").textContent = game.landed.right;
       document.getElementById("online").textContent = game.online;
+      const { left, right } = game.landed;
+      const drops = left + right;
+      document.getElementById("tally").textContent = drops === 0
+        ? "No drops yet"
+        : `Past ${drops} ${drops === 1 ? "drop" : "drops"} · ${left} left, ${right} right`;
 
       // Offer the name form until we have a name, then show the name instead.
       document.getElementById("claim").hidden = me.name !== null;
@@ -224,6 +249,21 @@
         buyButton.disabled = !game.betting_open || price > me.points;
       }
 
+      // Market odds. The two prices always add up to 1, so each is the chance the market gives
+      // that side. Rounded so the two percentages still add up to 100.
+      const leftPercent = Math.round(game.prices.left * 100);
+      const rightPercent = 100 - leftPercent;
+      document.getElementById("odds-left-label").textContent = `Left ${leftPercent}%`;
+      document.getElementById("odds-right-label").textContent = `${rightPercent}% Right`;
+      const leftBar = document.getElementById("odds-left");
+      const rightBar = document.getElementById("odds-right");
+      leftBar.style.flexGrow = leftPercent;
+      rightBar.style.flexGrow = rightPercent;
+      leftBar.title = `Left: ${leftPercent}% chance, ${game.prices.left.toFixed(2)} per share`;
+      rightBar.title = `Right: ${rightPercent}% chance, ${game.prices.right.toFixed(2)} per share`;
+      document.getElementById("odds-status").textContent =
+        !game.dropping ? "Even until the drop" : game.betting_open ? "Live" : "Betting closed";
+
       // The status line: what is happening on the left, and the countdown on the right.
       let status = "Waiting for the first drop";
       if (game.dropping) {
@@ -237,7 +277,7 @@
         game.dropping ? "" : `Next drop in ${Math.ceil(game.seconds_to_drop)}s`;
     }
 
-    // Each plus button asks the server to buy one share on its side at the current price.
+    // Each buy button asks the server to buy one share on its side at the current price.
     // The server answers with our new points and shares.
     for (const buyButton of document.querySelectorAll(".side button")) {
       buyButton.onclick = async () => {
@@ -271,9 +311,11 @@
       }
     };
 
+    // The top players, then, if we're ranked below them, a "…" gap and the players around us.
     function showLeaderboard() {
-      const rows = leaderboard.map((entry) => {
+      const toRow = (entry) => {
         const row = document.createElement("li");
+        row.value = entry.rank;  // the number the list shows, so the rows around us show e.g. 45 to 49
         const name = document.createElement("span");
         const points = document.createElement("span");
         name.textContent = entry.name;
@@ -282,7 +324,17 @@
         row.append(name, points);
         if (me && entry.name === me.name) row.className = "me";
         return row;
-      });
+      };
+      const rows = leaderboard.top.map(toRow);
+      const aroundMe = leaderboard.around_me;
+      // Only show the gap if some ranks really are skipped (not when we're 11th or 12th).
+      if (aroundMe.length > 0 && aroundMe[0].rank > leaderboard.top.length + 1) {
+        const gap = document.createElement("li");
+        gap.className = "gap";
+        gap.textContent = "…";
+        rows.push(gap);
+      }
+      rows.push(...aroundMe.map(toRow));
       document.getElementById("leaderboard").replaceChildren(...rows);
     }
 

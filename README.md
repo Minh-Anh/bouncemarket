@@ -42,7 +42,7 @@ The app is hosted on [Render](https://render.com), which reads `render.yaml`, in
 
 Everyone who opens the page watches the same ball and trades in the same market. A new ball drops 5 seconds after the last one lands.
 
-You start with 10 points. Each plus button buys one share on that side at the price shown. A share pays 1 point if the ball lands on its side and nothing if it doesn't. So a share bought at 0.30 makes 0.70 if it wins and loses 0.30 if it doesn't.
+You start with 10 points. Each "Buy 1 share" button buys one share on that side at the price shown. A share pays 1 point if the ball lands on its side and nothing if it doesn't. So a share bought at 0.30 makes 0.70 if it wins and loses 0.30 if it doesn't.
 
 You can buy only while the ball is falling: from the moment it drops until just before it passes the last row of pins. Shares can't be sold back; you hold them until the ball lands.
 
@@ -60,7 +60,7 @@ Every open page holds one stream from the server (as [server-sent events](https:
 
 - A public "game" message, 10 times a second, identical for every player: the countdown, the price of each side, and while the ball is falling, its next few positions.
 - A private "me" message with your name, points and shares, sent when you connect and after each round. Buying a share returns the same information.
-- A "leaderboard" message with the top 10 named players, sent when you connect and after each round.
+- A "leaderboard" message with the top 10 named players, sent when you connect and after each round. If you're ranked below the top 10, it also has the two players either side of you, which the page shows under a "…" with your row in yellow. To work out everyone's rank, the server reads every named player from the database once per round.
 
 Ball positions are sent up to 12 frames (a fifth of a second) early and the page plays them back on its own clock, which keeps the ball moving smoothly when the network delivers messages unevenly. That is as far ahead as a page ever sees, and betting closes that same fifth of a second before the ball passes the last row, so nobody can bet on a result they have already been sent.
 
