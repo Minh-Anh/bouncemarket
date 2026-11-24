@@ -540,7 +540,7 @@ async def events(request):
     """
     player_id = parse_id(request.query_params["player"])
     if player_id is None:
-        return JSONResponse({"error": "Bad player id."}, status_code=400)
+        return JSONResponse({"error": "bad player id."}, status_code=400)
     player = await get_player(player_id)
 
     async def stream():
@@ -564,15 +564,15 @@ async def buy(request):
     data = await request.json()
     side = data["side"]
     if side not in ("left", "right"):
-        return JSONResponse({"error": "Bad side."}, status_code=400)
+        return JSONResponse({"error": "bad side."}, status_code=400)
     player = players.get(parse_id(data["player"]))
     if player is None:
-        return JSONResponse({"error": "Unknown player."}, status_code=400)
+        return JSONResponse({"error": "unknown player."}, status_code=400)
     if not betting_open():
-        return JSONResponse({"error": "Trading is closed."}, status_code=400)
+        return JSONResponse({"error": "trading is closed."}, status_code=400)
     price = prices()[side]
     if price > player["points"]:
-        return JSONResponse({"error": "You don't have enough points."}, status_code=400)
+        return JSONResponse({"error": "you don't have enough points."}, status_code=400)
     player["points"] = round(player["points"] - price, 2)
     player["spent"] = round(player["spent"] + price, 2)
     player["shares"][side] += 1
@@ -585,13 +585,13 @@ async def claim_name(request):
     data = await request.json()
     player_id = parse_id(data["player"])
     if player_id not in players:
-        return JSONResponse({"error": "Unknown player."}, status_code=400)
+        return JSONResponse({"error": "unknown player."}, status_code=400)
     name = data["name"].strip()
     if not 1 <= len(name) <= 16 or not name.isprintable():
-        return JSONResponse({"error": "Names must be 1 to 16 characters."}, status_code=400)
+        return JSONResponse({"error": "usernames must be 1 to 16 characters."}, status_code=400)
 
     # Make sure we know whether this player already has a saved name before writing a new one.
-    sorry = JSONResponse({"error": "Couldn't save your name. Try again in a minute."}, status_code=503)
+    sorry = JSONResponse({"error": "couldn't save your username. try again in a minute."}, status_code=503)
     player = await get_player(player_id)
     if player["name"]:
         return JSONResponse(player)
@@ -602,7 +602,7 @@ async def claim_name(request):
     except httpx.HTTPError as error:
         # The database answers 409 when someone else already has the name.
         if isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 409:
-            return JSONResponse({"error": "Sorry, that name is taken."}, status_code=409)
+            return JSONResponse({"error": "sorry, that username is taken."}, status_code=409)
         print("Could not save a name:", repr(error))
         return sorry
     player["name"] = name
@@ -620,9 +620,9 @@ async def reset_points(request):
     data = await request.json()
     player = players.get(parse_id(data["player"]))
     if player is None or not player["name"]:
-        return JSONResponse({"error": "Unknown player."}, status_code=400)
+        return JSONResponse({"error": "unknown player."}, status_code=400)
     if player["spent"] > 0:
-        return JSONResponse({"error": "You can reset once this round is over."}, status_code=400)
+        return JSONResponse({"error": "you can reset once this round is over."}, status_code=400)
     player["points"] = 10
     named_points[player["name"]] = 10
     publish_leaderboard()
