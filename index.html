@@ -87,6 +87,23 @@
     #leaderboard li { padding: 3px 0; text-transform: lowercase; }  /* names are stored as typed, shown in lowercase */
     #leaderboard .points { float: right; font-weight: bold; }
     #leaderboard .me { color: var(--accent); }
+    /* The small reset button just left of our own points: just the icon, in the row's yellow. */
+    #leaderboard .reset {
+      margin-right: 4px; padding: 2px; border: none; background: none; color: inherit;
+      cursor: pointer; vertical-align: -2px; opacity: 0.7;
+    }
+    #leaderboard .reset:hover { opacity: 1; }
+
+    /* The confirmation dialog for a reset. */
+    dialog { max-width: 320px; border: none; border-radius: 12px; padding: 18px; background: var(--panel); color: var(--text); }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+    dialog h2 { margin-bottom: 8px; color: var(--text); }
+    dialog p { margin-bottom: 8px; }
+    .dialog-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+    .dialog-buttons button { font: inherit; padding: 6px 12px; border: none; border-radius: 8px; cursor: pointer; }
+    #reset-cancel { background: #333; color: var(--text); }
+    #reset-confirm { background: var(--accent); color: #111; font-weight: bold; }
+
     #leaderboard .gap { list-style: none; color: var(--muted); }  /* the "…" between the top 10 and the rows around you */
   </style>
 </head>
@@ -152,6 +169,26 @@
     </section>
   </main>
 </div>
+
+  <!-- The reset button shown on our own leaderboard row: two circling arrows. -->
+  <template id="reset-icon">
+    <button class="reset" type="button" aria-label="Reset to 10 points" title="Reset to 10 points">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>
+        <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>
+      </svg>
+    </button>
+  </template>
+
+  <dialog id="reset-dialog">
+    <h2>Reset your points?</h2>
+    <p>You'll go from <span id="reset-points"></span> back to 10 points. This can't be undone.</p>
+    <p class="muted" id="reset-error"></p>
+    <div class="dialog-buttons">
+      <button type="button" id="reset-cancel">Cancel</button>
+      <button type="button" id="reset-confirm">Reset to 10</button>
+    </div>
+  </dialog>
 
   <script>
     const canvas = document.getElementById("canvas");
@@ -299,6 +336,30 @@
       };
     }
 
+    // The reset dialog: start over with 10 points, after saying yes.
+    const resetDialog = document.getElementById("reset-dialog");
+    function openResetDialog() {
+      document.getElementById("reset-points").textContent = me.points;
+      document.getElementById("reset-error").textContent = "";
+      resetDialog.showModal();
+    }
+    document.getElementById("reset-cancel").onclick = () => resetDialog.close();
+    document.getElementById("reset-confirm").onclick = async () => {
+      const response = await fetch("/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ player: playerId }),
+      });
+      const result = await response.json();
+      if (response.ok) {
+        me = result;
+        render();
+        resetDialog.close();
+      } else {
+        document.getElementById("reset-error").textContent = result.error;
+      }
+    };
+
     // Claim a name, which puts us on the leaderboard.
     document.getElementById("claim").onsubmit = async (event) => {
       event.preventDefault();  // stop the browser reloading the page, its default for forms
@@ -327,8 +388,15 @@
         name.textContent = entry.name;
         points.textContent = entry.points;
         points.className = "points";
-        row.append(name, points);
-        if (me && entry.name === me.name) row.className = "me";
+        row.append(name);
+        if (me && entry.name === me.name) {
+          row.className = "me";
+          // Our own row gets a small reset button just left of the points, which asks before doing anything.
+          const reset = document.getElementById("reset-icon").content.firstElementChild.cloneNode(true);
+          reset.onclick = openResetDialog;
+          points.prepend(reset);
+        }
+        row.append(points);
         return row;
       };
       const rows = leaderboard.top.map(toRow);

@@ -48,9 +48,9 @@ You can buy only while the ball is falling: from the moment it drops until just 
 
 The price of a side is its fraction of all the shares bought this round, starting at 0.50 each, so the two prices always add up to 1. Every buy pushes that side's price up and the other side's down. Being right early, while a side is still cheap, pays more than piling in once everyone agrees.
 
-There is also a counterparty with a simple strategy: it buys one share on whichever half of the board the ball starts in, then one more every 0.5 seconds on whichever half the ball is in at that moment, until betting closes. Its buying drifts the price towards the side the ball has been spending its time on. The counterparty is also the seller of every share you buy: it keeps what you pay and pays out the winners.
+There is also a counterparty with a simple strategy: it buys one share on whichever half of the board the ball starts in, then keeps buying on whichever half the ball is in at that moment, until betting closes. It buys faster the lower the ball is: once a second with the ball at the top, speeding up to 10 times a second by the bottom of the betting zone, where the ball's position says the most about where it will land. Its buying drifts the price towards the side the ball has been spending its time on, and most strongly towards where it is near the end. The counterparty is also the seller of every share you buy: it keeps what you pay and pays out the winners.
 
-Anyone can play straight away. To appear on the leaderboard, enter a name of up to 16 characters. Names are unique, and from then on your points are saved.
+Anyone can play straight away. To appear on the leaderboard, enter a name of up to 16 characters. Names are unique, and from then on your points are saved. The circling-arrows button beside your name on the leaderboard starts you over with 10 points, after asking first. It can't be used while you hold shares in the round being played.
 
 ## How it works
 

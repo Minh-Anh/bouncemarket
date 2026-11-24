@@ -44,7 +44,10 @@ FINAL_STRETCH_FRAMES = 90  # for the last 1.5 seconds before betting closes, and
 EARLY_AHEAD_FRAMES = 48  # before that, send positions this far ahead (0.8 seconds), so a message is needed only every half second
 POSITION_DECIMALS = 1  # ball positions are sent rounded to tenths of a pixel; 0 (whole pixels) is ~15% smaller but may look steppy
 BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the page can play back smoothly
-COUNTERPARTY_BUY_FRAMES = 30  # the counterparty buys every 30 frames, which is 0.5 seconds
+# The counterparty buys faster as the ball falls: every 60 frames (1 second) with the ball at
+# the top, speeding up to every 6 frames (0.1 seconds) by the bottom of the betting zone.
+COUNTERPARTY_SLOWEST_FRAMES = 60
+COUNTERPARTY_FASTEST_FRAMES = 6
 COUNTDOWN_SECONDS = 5  # the wait between one ball landing and the next one dropping
 LEADERBOARD_SIZE = 10
 NEIGHBORS = 2  # a player ranked below the top 10 also sees this many players either side of them
@@ -99,6 +102,7 @@ game = {
     "path": None,
     "bucket": None,
     "close_frame": 0,  # betting closes when the ball reaches this frame
+    "counterparty_buys": [],  # the counterparty's buys this drop, as [(frame, side)], from counterparty_buys()
     "sent_frames": 0,  # how many frames of the path have been sent to the pages so far
     "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
     "last_bucket": None,  # where the previous ball landed
@@ -296,18 +300,39 @@ def betting_open():
     return game["dropping"] and current_frame() < game["close_frame"]
 
 
+def counterparty_buys(path, close_frame):
+    """The frames the counterparty buys on this drop, and the side it buys each time.
+
+    It buys one share at the drop, then keeps buying until betting closes, each time on
+    whichever half of the board the ball is in at that moment. The lower the ball, the
+    sooner the next buy: the wait shrinks in a straight line from COUNTERPARTY_SLOWEST_FRAMES
+    with the ball at the top to COUNTERPARTY_FASTEST_FRAMES with the ball as low as it is
+    when betting closes. So it piles in as the ball nears the bottom, when where the ball
+    is says the most about where it will land. It never buys at close_frame itself.
+    """
+    bottom = max(1, path[close_frame][1])  # how far down the ball is when betting closes
+    buys = []
+    frame = 0
+    while frame < close_frame:
+        x, y = path[frame]
+        buys.append((frame, "left" if x < WIDTH / 2 else "right"))
+        depth = min(1, max(0, y / bottom))  # 0 at the top, 1 at the bottom of the betting zone
+        frame += round(COUNTERPARTY_SLOWEST_FRAMES - (COUNTERPARTY_SLOWEST_FRAMES - COUNTERPARTY_FASTEST_FRAMES) * depth)
+    return buys
+
+
 def counterparty_shares():
     """How many shares the counterparty has bought on each side so far this round.
 
-    It buys one share at the drop and one more every 0.5 seconds until betting closes, each
-    time on whichever half of the board the ball is in at that moment. It never collects on
-    them. They only move the price, towards the side the ball has been spending its time on.
+    It never collects on them. They only move the price, towards the side the ball has been
+    spending its time on, and most of all towards where it has been lately.
     """
     shares = {"left": 0, "right": 0}
     if game["dropping"]:
-        frames = min(current_frame() + 1, game["close_frame"])
-        for frame in range(0, frames, COUNTERPARTY_BUY_FRAMES):
-            side = "left" if game["path"][frame][0] < WIDTH / 2 else "right"
+        now = current_frame()
+        for frame, side in game["counterparty_buys"]:
+            if frame > now:
+                break
             shares[side] += 1
     return shares
 
@@ -373,14 +398,16 @@ async def run_rounds():
         await asyncio.sleep(max(0, game["drops_at"] - time.time()))
         path, bucket = simulate_drop()
         last_row_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
+        # Pages see BUFFER_FRAMES ahead, so betting closes that long before the ball
+        # passes the last row. Nobody can bet after seeing which side of the divider it took.
+        close_frame = max(0, last_row_frame - BUFFER_FRAMES)
         game.update(
             dropping=True,
             started_at=time.time(),
             path=path,
             bucket=bucket,
-            # Pages see BUFFER_FRAMES ahead, so betting closes that long before the ball
-            # passes the last row. Nobody can bet after seeing which side of the divider it took.
-            close_frame=max(0, last_row_frame - BUFFER_FRAMES),
+            close_frame=close_frame,
+            counterparty_buys=counterparty_buys(path, close_frame),
             sent_frames=0,
         )
         await asyncio.sleep(len(path) * FRAME_SECONDS)
@@ -554,12 +581,35 @@ async def claim_name(request):
     except httpx.HTTPError as error:
         # The database answers 409 when someone else already has the name.
         if isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 409:
-            return JSONResponse({"error": "That name is taken."}, status_code=409)
+            return JSONResponse({"error": "Sorry, that name is taken."}, status_code=409)
         print("Could not save a name:", repr(error))
         return sorry
     player["name"] = name
     named_points[name] = player["points"]
     publish_leaderboard()
+    return JSONResponse(player)
+
+
+async def reset_points(request):
+    """Start a named player over with 10 points, whatever they had before.
+
+    Not while they hold shares in the round being played. Otherwise someone could spend all
+    their points pushing a price around, reset, and do it again for free.
+    """
+    data = await request.json()
+    player = players.get(parse_id(data["player"]))
+    if player is None or not player["name"]:
+        return JSONResponse({"error": "Unknown player."}, status_code=400)
+    if player["spent"] > 0:
+        return JSONResponse({"error": "You can reset once this round is over."}, status_code=400)
+    player["points"] = 10
+    named_points[player["name"]] = 10
+    publish_leaderboard()
+    try:
+        await save_players([{"id": parse_id(data["player"]), "name": player["name"], "points": 10}])
+    except httpx.HTTPError as error:
+        # Like a round's save: these points are saved after the next round the player plays in.
+        print("Could not save a reset:", repr(error))
     return JSONResponse(player)
 
 
@@ -580,6 +630,7 @@ app = Starlette(
         Route("/events", events),
         Route("/buy", buy, methods=["POST"]),
         Route("/name", claim_name, methods=["POST"]),
+        Route("/reset", reset_points, methods=["POST"]),
     ],
     lifespan=lifespan,
 )
