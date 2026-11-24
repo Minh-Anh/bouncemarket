@@ -38,7 +38,11 @@ BOUNCE = args.bounce
 DT = 1 / 240  # seconds per physics step
 STEPS_PER_FRAME = 4  # the page is sent one ball position per frame
 FRAME_SECONDS = STEPS_PER_FRAME * DT  # 1/60 second
-BROADCASTS_PER_SECOND = 10  # how often every page is sent the state of the game
+BROADCASTS_PER_SECOND = 10  # the most often every page is sent the state of the game; see broadcast()
+FRAMES_PER_BROADCAST = 6  # 60 frames a second / 10 broadcasts a second
+FINAL_STRETCH_FRAMES = 90  # for the last 1.5 seconds before betting closes, and until the ball lands, send every broadcast
+EARLY_AHEAD_FRAMES = 48  # before that, send positions this far ahead (0.8 seconds), so a message is needed only every half second
+POSITION_DECIMALS = 1  # ball positions are sent rounded to tenths of a pixel; 0 (whole pixels) is ~15% smaller but may look steppy
 BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the page can play back smoothly
 COUNTERPARTY_BUY_FRAMES = 30  # the counterparty buys every 30 frames, which is 0.5 seconds
 COUNTDOWN_SECONDS = 5  # the wait between one ball landing and the next one dropping
@@ -99,7 +103,7 @@ game = {
     "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
     "last_bucket": None,  # where the previous ball landed
     "landed": {"left": 0, "right": 0},  # how many balls have landed in each bucket
-    "ranking": [],  # every named player, most points first, as [{"name": ..., "points": ...}]
+    "ranking": [],  # every named player, most points first, as [{"name": ..., "points": ...}], made from named_points
     "positions": {},  # each name's index in "ranking", so a player can be found quickly
 }
 
@@ -109,6 +113,10 @@ game = {
 # "name" is None until the player claims one. "shares" and "spent" are what the player has
 # bought, and paid for it, in the current round. "loaded" is explained in get_player().
 players = {}
+
+# Every named player's points, {name: points}, for the leaderboard. Loaded from the database
+# when the server starts, then updated here whenever a named player's points change.
+named_points = {}
 
 # One entry per open page: a queue of messages waiting to be sent to it, and whose page it is.
 streams = {}  # {queue: player_id}
@@ -191,27 +199,41 @@ async def save_players(rows):
         response.raise_for_status()
 
 
-async def refresh_leaderboard():
-    """Fetch every named player from the database, best first, and send each page its leaderboard.
+async def load_ranking():
+    """Read every named player's points from the database, once, when the server starts.
 
-    We need everyone, not just the top few, so we can tell a player ranked 47th who is
-    around them. The database hands rows over at most PAGE_SIZE at a time, so we ask
-    page by page. That is one small request per round for the first thousand players.
-    Players with the same points are ranked by name, so the order never shuffles.
+    After that the server keeps the ranking up to date itself. It is the only thing that
+    changes anyone's points, so it already knows every change without asking the database.
+    The database hands rows over at most PAGE_SIZE at a time, so we ask page by page.
+    If the database can't be reached, we keep trying every 30 seconds. Players who play in
+    the meantime are ranked with their newer points, which the database rows don't overwrite.
     """
-    ranking = []
-    try:
-        while True:
-            params = {"select": "name,points", "order": "points.desc,name.asc", "limit": PAGE_SIZE, "offset": len(ranking)}
-            response = await db.get("/players", params=params)
-            response.raise_for_status()
-            page = response.json()
-            ranking += page
-            if len(page) < PAGE_SIZE:
-                break
-    except httpx.HTTPError as error:
-        print("Could not load the leaderboard:", repr(error))  # keep showing the last one we got
+    while True:
+        rows = []
+        try:
+            while True:
+                params = {"select": "name,points", "limit": PAGE_SIZE, "offset": len(rows), "order": "id"}
+                response = await db.get("/players", params=params)
+                response.raise_for_status()
+                page = response.json()
+                rows += page
+                if len(page) < PAGE_SIZE:
+                    break
+        except httpx.HTTPError as error:
+            print("Could not load the leaderboard, trying again in 30 seconds:", repr(error))
+            await asyncio.sleep(30)
+            continue
+        for row in rows:
+            named_points.setdefault(row["name"], row["points"])
+        publish_leaderboard()
         return
+
+
+def publish_leaderboard():
+    """Rank the named players, most points first, and send each page its leaderboard.
+    Players with the same points are ranked by name, so the order never shuffles."""
+    ranking = [{"name": name, "points": points} for name, points in named_points.items()]
+    ranking.sort(key=lambda row: (-row["points"], row["name"]))
     game["ranking"] = ranking
     game["positions"] = {row["name"]: i for i, row in enumerate(ranking)}
     for queue, player_id in streams.items():
@@ -307,7 +329,8 @@ def prices():
 
 def sse(event, data):
     """Format one server-sent event, the browser's built-in format for a stream of messages."""
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    # No spaces after commas and colons: the same JSON, a little smaller to send to every page.
+    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
 
 
 def send(queue, message):
@@ -337,6 +360,8 @@ def settle():
     game["shares"] = {"left": 0, "right": 0}
     game["last_bucket"] = bucket
     game["landed"][bucket] += 1
+    for row in rows:
+        named_points[row["name"]] = row["points"]
     for queue, player_id in streams.items():
         send(queue, sse("me", players[player_id]))
     return rows
@@ -367,20 +392,53 @@ async def run_rounds():
         except httpx.HTTPError as error:
             # The game carries on. These players' points are saved after the next round they play.
             print("Could not save points:", repr(error))
-        await refresh_leaderboard()
+        publish_leaderboard()
+
+
+def rounded(position):
+    """A ball position rounded to POSITION_DECIMALS places, to keep messages short."""
+    if POSITION_DECIMALS == 0:
+        return [round(position[0]), round(position[1])]  # whole numbers, sent without a ".0"
+    return [round(position[0], POSITION_DECIMALS), round(position[1], POSITION_DECIMALS)]
 
 
 async def broadcast():
-    """Send every page the public state of the game, several times a second.
+    """Send every page the public state of the game: up to 10 times a second, but only as often as needed.
 
     The message is built once and the same text goes to everyone. While the ball is falling
-    it carries the next few positions on the path, up to BUFFER_FRAMES ahead of now. The page
-    plays them back on its own clock, so it always has some in hand and the ball moves
-    smoothly even when the network delivers messages unevenly.
+    it carries the next positions on the path, ahead of time. The page plays them back on its
+    own clock, so it always has some in hand and the ball moves smoothly even when the
+    network delivers messages unevenly.
+
+    Most of the cost of a big game is these messages, so we send as few as we can:
+    - Early in the drop, positions go out EARLY_AHEAD_FRAMES ahead, about twice a second.
+    - For the last FINAL_STRETCH_FRAMES before betting closes, and until the ball lands, they go
+      out only BUFFER_FRAMES ahead, every broadcast. Betting closes BUFFER_FRAMES before the ball
+      passes the last row, so no page is ever sent the ball's side of the divider while it can still bet.
+    - Between drops, once a second, just for the countdown and the price.
+    - Straight away whenever a drop starts or the ball lands.
     """
+    ticks_since_sent = 0
+    was_dropping = None
     while True:
         await asyncio.sleep(1 / BROADCASTS_PER_SECOND)
+        ticks_since_sent += 1
         path = game["path"]
+        dropping = game["dropping"]
+        if dropping:
+            frame = current_frame()
+            final_stretch = frame >= game["close_frame"] - FINAL_STRETCH_FRAMES
+            ahead = BUFFER_FRAMES if final_stretch else EARLY_AHEAD_FRAMES
+            # Early on, send only when the pages would otherwise have less than BUFFER_FRAMES in hand by the next broadcast.
+            running_low = game["sent_frames"] <= frame + BUFFER_FRAMES + FRAMES_PER_BROADCAST
+            due = final_stretch or running_low
+        else:
+            due = ticks_since_sent >= BROADCASTS_PER_SECOND
+        if not due and dropping == was_dropping:
+            continue
+        ticks_since_sent = 0
+        was_dropping = dropping
+
         message = {
             "dropping": game["dropping"],
             "seconds_to_drop": max(0, game["drops_at"] - time.time()),
@@ -390,16 +448,17 @@ async def broadcast():
             "last_bucket": game["last_bucket"],
             "landed": game["landed"],
         }
-        if game["dropping"]:
-            frame = current_frame()
+        if dropping:
             # The positions the pages don't have yet, and the frame number of the first of them.
-            end = min(frame + BUFFER_FRAMES + 1, len(path))
+            # Never past close_frame + BUFFER_FRAMES (the last row) while betting is open, however early it is.
+            end = min(frame + ahead + 1, len(path))
+            if betting_open():
+                end = min(end, game["close_frame"] + BUFFER_FRAMES)
+            start = min(game["sent_frames"], end)
             message["frame"] = frame
-            message["first_position"] = game["sent_frames"]
-            message["positions"] = path[game["sent_frames"]:end]
-            game["sent_frames"] = end
-        else:
-            message["ball"] = path[-1] if path else None  # between drops the ball rests where it landed
+            message["first_position"] = start
+            message["positions"] = [rounded(position) for position in path[start:end]]
+            game["sent_frames"] = max(game["sent_frames"], end)
 
         text = sse("game", message)
         for queue in streams:
@@ -499,15 +558,16 @@ async def claim_name(request):
         print("Could not save a name:", repr(error))
         return sorry
     player["name"] = name
-    await refresh_leaderboard()
+    named_points[name] = player["points"]
+    publish_leaderboard()
     return JSONResponse(player)
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app):
-    """Load the leaderboard, then start the round loop and the broadcaster, when the server starts."""
-    await refresh_leaderboard()
-    tasks = [asyncio.create_task(run_rounds()), asyncio.create_task(broadcast())]
+    """When the server starts: load the leaderboard, and start the round loop and the broadcaster.
+    The game starts straight away, even if the leaderboard takes a few tries to load."""
+    tasks = [asyncio.create_task(load_ranking()), asyncio.create_task(run_rounds()), asyncio.create_task(broadcast())]
     yield
     for task in tasks:
         task.cancel()

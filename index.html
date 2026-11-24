@@ -273,8 +273,14 @@
         status = `Landed ${game.last_bucket} · ${sign}${me.last_won} points`;
       }
       document.getElementById("status").textContent = status;
-      document.getElementById("countdown").textContent =
-        game.dropping ? "" : `Next drop in ${Math.ceil(game.seconds_to_drop)}s`;
+      showCountdown();
+    }
+
+    // Between drops the server only sends a message once a second, so the countdown runs on
+    // our own clock, from the drop time we worked out when the ball landed.
+    function showCountdown() {
+      const seconds = dropsAt === null ? 0 : Math.max(0, Math.ceil((dropsAt - performance.now()) / 1000));
+      document.getElementById("countdown").textContent = game.dropping ? "" : `Next drop in ${seconds}s`;
     }
 
     // Each buy button asks the server to buy one share on its side at the current price.
@@ -338,23 +344,24 @@
       document.getElementById("leaderboard").replaceChildren(...rows);
     }
 
-    // The public "game" message arrives 10 times a second. While the ball is falling, each
-    // one carries the next few ball positions, a little ahead of time. We queue them and
-    // play them back on our own clock, so uneven arrival times don't make the ball stutter.
+    // The public "game" message arrives up to 10 times a second: twice a second early in a drop,
+    // 10 times a second near the end of one, and once a second between drops. While the ball is
+    // falling, each one carries the next ball positions, ahead of time. We queue them and play
+    // them back on our own clock, so uneven arrival times don't make the ball stutter.
     function receiveGame(update) {
       game = update;
-      render();
       if (!game.dropping) {
         queue = [];
         dropStart = null;
         // Set once per countdown, so network jitter in later messages doesn't make the fade flicker.
         if (dropsAt === null) dropsAt = performance.now() + game.seconds_to_drop * 1000;
-        return;
+      } else {
+        dropsAt = null;
+        // game.frame is the frame the server is on right now, which tells us when the drop began.
+        if (dropStart === null) dropStart = performance.now() - game.frame * 1000 / FPS;
+        game.positions.forEach(([x, y], i) => queue.push([game.first_position + i, x, y]));
       }
-      dropsAt = null;
-      // game.frame is the frame the server is on right now, which tells us when the drop began.
-      if (dropStart === null) dropStart = performance.now() - game.frame * 1000 / FPS;
-      game.positions.forEach(([x, y], i) => queue.push([game.first_position + i, x, y]));
+      render();
     }
 
     // Runs before every screen refresh. While the ball falls, draw the newest queued position
@@ -367,6 +374,7 @@
         if (latest) draw([latest[1], latest[2]]);
       } else if (dropsAt !== null) {
         draw(null);
+        if (game) showCountdown();
       }
       requestAnimationFrame(play);
     }
