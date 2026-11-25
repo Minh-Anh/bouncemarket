@@ -1,11 +1,12 @@
 # /// script
-# dependencies = ["httpx", "starlette", "uvicorn"]  # keep in sync with requirements.txt
+# dependencies = ["httpx==0.28.1", "starlette==1.10.0", "uvicorn[standard]==0.54.0"]  # keep in sync with requirements.txt
 # ///
 import argparse
 import asyncio
 import bisect
 import contextlib
 import datetime
+import hmac
 import json
 import math
 import os
@@ -18,8 +19,10 @@ import zlib
 import httpx
 import uvicorn
 from starlette.applications import Starlette
-from starlette.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.routing import Route
+
+import names  # names.py, in this folder: the rules for usernames
 
 # Board geometry, in pixels. (0, 0) is the top-left corner.
 WIDTH, HEIGHT = 400, 560
@@ -96,6 +99,10 @@ db = httpx.AsyncClient(
     timeout=10,
 )
 
+# The owner's key for the moderation routes under /admin (see the admin functions below).
+# Optional: without it those routes don't exist, as far as anyone outside can tell.
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()
+
 # Everything below lives in memory, so it resets when the server restarts.
 # The whole server runs on one thread (see the bottom of the file), so none of it needs locks.
 
@@ -119,18 +126,27 @@ game = {
     "ranking": [],  # every named player, most points first, as [{"name": ..., "points": ...}], made from named_points
     "positions": {},  # each name's index in "ranking", so a player can be found quickly
     "minus_points": [],  # minus each player's points, in "ranking" order, so it ascends for bisect
+    "ranking_loaded": False,  # whether load_ranking() has read the whole players table yet
 }
 
 # One entry per player who has opened the page since the server started, keyed by the
 # random id their browser sends:
-# {"name": None, "points": 10, "shares": {"left": 0, "right": 0}, "spent": 0, "last_won": 0, "loaded": True}
+# {"name": None, "points": 10, "shares": {"left": 0, "right": 0}, "spent": 0, "last_won": 0,
+#  "loaded": True, "name_locked": False}
 # "name" is None until the player claims one. "shares" and "spent" are what the player has
 # bought, and paid for it, in the current round. "loaded" is explained in get_player().
+# "name_locked" is True once the owner has replaced the player's name (see admin_rename()),
+# and stops them changing it themselves.
 players = {}
 
 # Every named player's points, {name: points}, for the leaderboard. Loaded from the database
 # when the server starts, then updated here whenever a named player's points change.
 named_points = {}
+
+# The id of every player who has a row in the database: read by load_ranking() when the server
+# starts, and added to whenever a player claims a name. Once the whole table has been read,
+# an id that isn't here can't have a row, so get_player() doesn't need to ask the database.
+saved_ids = set()
 
 # One entry per open page: a queue of messages waiting to be sent to it, and whose page it is.
 streams = {}  # {queue: player_id}
@@ -216,19 +232,47 @@ def positions(states):
 
 
 def parse_id(text):
-    """Player ids are UUIDs, the random ids browsers make. Returns None for anything else."""
+    """Player ids are UUIDs, the random ids browsers make. Returns None for anything else,
+    including something that isn't text at all, or is missing."""
+    if not isinstance(text, str):
+        return None
     try:
         return str(uuid.UUID(text))
     except ValueError:
         return None
 
 
+async def read_json(request):
+    """The JSON object a request sent, or an empty dict if it sent anything else (nothing,
+    broken JSON, a list...). So a bad request gets the handler's own 400 and not a crash."""
+    try:
+        data = await request.json()
+    except ValueError:  # broken JSON, or bytes that aren't text
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 async def load_player(player_id):
-    """Fetch a named player's row from the database, or None if this id never claimed a name."""
-    response = await db.get("/players", params={"id": "eq." + player_id, "select": "name,points"})
+    """Fetch a named player's row from the database, or None if this id never claimed a name.
+
+    It asks for every column ("*") rather than naming them, so that it still works before the
+    owner has added the name_locked column (see schema.sql): the row then just has no
+    "name_locked", which counts as unlocked. Naming a missing column would make the database
+    refuse every lookup, and no returning player could load their name.
+    """
+    response = await db.get("/players", params={"id": "eq." + player_id, "select": "*"})
     response.raise_for_status()
     rows = response.json()
     return rows[0] if rows else None
+
+
+def use_saved_row(player_id, row):
+    """Give a player in memory the name, points and lock from their database row."""
+    player = players[player_id]
+    player["name"], player["points"] = row["name"], row["points"]
+    player["name_locked"] = bool(row.get("name_locked", False))  # missing until schema.sql adds the column
+    player["loaded"] = True
+    saved_ids.add(player_id)
 
 
 async def save_players(rows):
@@ -238,32 +282,52 @@ async def save_players(rows):
         response.raise_for_status()
 
 
+async def read_all_players(columns):
+    """Every row of the players table, with the columns asked for, e.g. "id,name,points".
+    The database hands rows over at most PAGE_SIZE at a time, so we ask page by page."""
+    rows = []
+    while True:
+        params = {"select": columns, "limit": PAGE_SIZE, "offset": len(rows), "order": "id"}
+        response = await db.get("/players", params=params)
+        response.raise_for_status()
+        page = response.json()
+        rows += page
+        if len(page) < PAGE_SIZE:
+            return rows
+
+
 async def load_ranking():
-    """Read every named player's points from the database, once, when the server starts.
+    """Read every named player's id and points from the database, once, when the server starts.
 
     After that the server keeps the ranking up to date itself. It is the only thing that
     changes anyone's points, so it already knows every change without asking the database.
-    The database hands rows over at most PAGE_SIZE at a time, so we ask page by page.
     If the database can't be reached, we keep trying every 30 seconds. Players who play in
     the meantime are ranked with their newer points, which the database rows don't overwrite.
+
+    The ids go into saved_ids, so that from then on a new visitor's page can start without
+    asking the database about them (see get_player()). They are added to what is already
+    there, never put in its place: a player who claims a name while the pages are being read
+    is added by set_name(), and their row may be too new to be on a page we have read.
     """
     while True:
-        rows = []
         try:
-            while True:
-                params = {"select": "name,points", "limit": PAGE_SIZE, "offset": len(rows), "order": "id"}
-                response = await db.get("/players", params=params)
-                response.raise_for_status()
-                page = response.json()
-                rows += page
-                if len(page) < PAGE_SIZE:
-                    break
+            rows = await read_all_players("id,name,points")
         except httpx.HTTPError as error:
             print("Could not load the leaderboard, trying again in 30 seconds:", repr(error))
             await asyncio.sleep(30)
             continue
         for row in rows:
-            named_points.setdefault(row["name"], row["points"])
+            player = players.get(row["id"])
+            if player and player["loaded"]:
+                # This player has loaded since the server started, so what we hold in memory is
+                # newer than the row: they may have renamed themselves while we were reading,
+                # and the row's old name mustn't come back onto the leaderboard.
+                if player["name"]:
+                    named_points.setdefault(player["name"], player["points"])
+            else:
+                named_points.setdefault(row["name"], row["points"])
+        saved_ids.update(row["id"] for row in rows)
+        game["ranking_loaded"] = True
         publish_leaderboard()
         return
 
@@ -320,6 +384,14 @@ async def get_player(player_id):
     If they claimed a name before, the database has their name and points, and we load those.
     If the database can't be reached they can still play, without a name for now, and we
     look again the next time they connect. "loaded" records whether that lookup has worked.
+
+    Most new ids are new visitors, who have never claimed a name. Once load_ranking() has read
+    the whole players table, saved_ids holds every id that has a row, so for any other id we
+    already know the answer is "no row" and don't ask. Until then (just after a restart, or
+    while the database is down) we ask about every player, as there is no other way to know.
+    A player who does have a row is still looked up here, the first time they connect: the
+    database is always at least as up to date as what load_ranking() read, as the server
+    writes every change there, and the lookup also brings their name_locked.
     """
     if player_id not in players:
         players[player_id] = {
@@ -329,18 +401,25 @@ async def get_player(player_id):
             "spent": 0,
             "last_won": 0,
             "loaded": False,
+            "name_locked": False,
         }
     player = players[player_id]
+    if not player["loaded"] and game["ranking_loaded"] and player_id not in saved_ids:
+        player["loaded"] = True
     if not player["loaded"]:
         try:
             saved = await load_player(player_id)
         except httpx.HTTPError as error:
             print("Could not load a player:", repr(error))
             return player
-        if not player["loaded"]:  # another request for the same player may have finished first
-            player["loaded"] = True
+        # Another request for the same player may have finished first, or the owner may have
+        # renamed them meanwhile (see admin_rename()). Either way the newer answer is already
+        # in memory, and this one mustn't overwrite it.
+        if not player["loaded"]:
             if saved:
-                player["name"], player["points"] = saved["name"], saved["points"]
+                use_saved_row(player_id, saved)
+            else:
+                player["loaded"] = True
     return player
 
 
@@ -431,6 +510,13 @@ def send(queue, message):
     """Queue a message for one page. A page that has fallen far behind misses it instead."""
     if not queue.full():
         queue.put_nowait(message)
+
+
+def send_to_player(player_id, message):
+    """Queue a message for every page this player has open (they may have more than one tab)."""
+    for queue, owner in streams.items():
+        if owner == player_id:
+            send(queue, message)
 
 
 def settle():
@@ -761,7 +847,7 @@ async def events(request):
     message (the top players, plus the players around it) when it connects and whenever the
     leaderboard is refreshed.
     """
-    player_id = parse_id(request.query_params["player"])
+    player_id = parse_id(request.query_params.get("player"))
     if player_id is None:
         return JSONResponse({"error": "bad player id."}, status_code=400)
     player = await get_player(player_id)
@@ -784,11 +870,11 @@ async def events(request):
 
 async def buy(request):
     """Buy one share on one side, at the current price."""
-    data = await request.json()
-    side = data["side"]
+    data = await read_json(request)
+    side = data.get("side")
     if side not in ("left", "right"):
         return JSONResponse({"error": "bad side."}, status_code=400)
-    player_id = parse_id(data["player"])
+    player_id = parse_id(data.get("player"))
     player = players.get(player_id)
     if player is None:
         return JSONResponse({"error": "unknown player."}, status_code=400)
@@ -813,24 +899,56 @@ async def buy(request):
 
 async def set_name(request):
     """Give a player a name, which puts them on the leaderboard, or change the name they have
-    to any other that nobody is using. Names are unique, ignoring capitals."""
-    data = await request.json()
-    player_id = parse_id(data["player"])
+    to any other that nobody is using. Names are unique, ignoring capitals.
+
+    A name must pass the rules in names.py (length, characters, reserved names and a word
+    filter). They are checked only here, when a name is set or changed: names saved before a
+    rule existed stay as they are, and the owner deals with any bad ones (see admin_rename()).
+    A player whose name the owner has locked can't change it.
+    """
+    data = await read_json(request)
+    player_id = parse_id(data.get("player"))
     if player_id not in players:
         return JSONResponse({"error": "unknown player."}, status_code=400)
-    name = data["name"].strip()
-    if not 1 <= len(name) <= 16 or not name.isprintable():
-        return JSONResponse({"error": "usernames must be 1 to 16 characters."}, status_code=400)
+    locked = JSONResponse({"error": "your username can't be changed."}, status_code=403)
+    if players[player_id]["name_locked"]:
+        return locked
+    name = data.get("name")
+    if not isinstance(name, str):
+        return JSONResponse({"error": "bad username."}, status_code=400)
+    name = name.strip()
+    problem = names.name_problem(name)
+    if problem:
+        return JSONResponse({"error": problem}, status_code=400)
 
     # Make sure we know whether this player already has a saved name before writing a new one.
     sorry = JSONResponse({"error": "couldn't save your username. try again in a minute."}, status_code=503)
     player = await get_player(player_id)
     if not player["loaded"]:
         return sorry
-    if name == player["name"]:
-        return JSONResponse(player)
+    if player["name"] is None:
+        # Ask the database once more before a first name is written, as that write replaces any
+        # row with this id. get_player() may have known "no row" only from load_ranking()'s read
+        # at startup, and during a deploy the previous server keeps serving for a little while:
+        # a name claimed there after our read would be overwritten. If there is a row, the
+        # player takes it up (name, points and lock), and what they asked for is a change of name.
+        try:
+            saved = await load_player(player_id)
+        except httpx.HTTPError as error:
+            print("Could not load a player:", repr(error))
+            return sorry
+        if saved and player["name"] is None:
+            use_saved_row(player_id, saved)
+            named_points.setdefault(saved["name"], saved["points"])
+            send_to_player(player_id, sse("me", player))
+            publish_leaderboard()
     try:
         async with saving_players:
+            # Checked again here, as the owner may have locked the name while we waited our turn.
+            if player["name_locked"]:
+                return locked
+            if name == player["name"]:
+                return JSONResponse(player)
             old_name = player["name"]
             if old_name:
                 # A change of name writes only the name. Their saved points stay as they are.
@@ -839,6 +957,7 @@ async def set_name(request):
             else:
                 await save_players([{"id": player_id, "name": name, "points": player["points"]}])
             player["name"] = name
+            saved_ids.add(player_id)  # they have a row now, which get_player() must look up next time
             # On the leaderboard, the new name takes over the points shown beside the old one.
             named_points[name] = named_points.pop(old_name, player["points"])
     except httpx.HTTPError as error:
@@ -852,27 +971,213 @@ async def set_name(request):
 
 
 async def reset_points(request):
-    """Start a named player over with 10 points, whatever they had before.
+    """Start a player over with 10 points, whatever they had before. Guests too, so someone
+    who loses everything before claiming a name isn't stuck.
 
     Not while they hold shares in the round being played. Otherwise someone could spend all
     their points pushing a price around, reset, and do it again for free.
     """
-    data = await request.json()
-    player = players.get(parse_id(data["player"]))
-    if player is None or not player["name"]:
+    data = await read_json(request)
+    player_id = parse_id(data.get("player"))
+    player = players.get(player_id)
+    if player is None:
         return JSONResponse({"error": "unknown player."}, status_code=400)
     if player["spent"] > 0:
         return JSONResponse({"error": "you can reset once this round is over."}, status_code=400)
     player["points"] = 10
+    if not player["name"]:
+        # A guest has nothing saved in the database, and is on no leaderboard but their own,
+        # so only their own pages need a new one.
+        send_to_player(player_id, leaderboard_message(player))
+        return JSONResponse(player)
     named_points[player["name"]] = 10
     publish_leaderboard()
     try:
         async with saving_players:
-            await save_players([{"id": parse_id(data["player"]), "name": player["name"], "points": 10}])
+            await save_players([{"id": player_id, "name": player["name"], "points": 10}])
     except httpx.HTTPError as error:
         # Like a round's save: these points are saved after the next round the player plays in.
         print("Could not save a reset:", repr(error))
     return JSONResponse(player)
+
+
+# Moderation, for the owner. If a bad name reaches the leaderboard, the owner can give it a
+# neutral name straight away, without a restart, and lock it so the player can't change it
+# back. The lock is the name_locked column of the players table, so it survives a restart.
+# These routes need the ADMIN_KEY environment variable, sent as "Authorization: Bearer <key>".
+# The README has the commands to use them.
+
+
+def admin_refusal(request):
+    """None if the request carries the owner's key. Otherwise the response to send instead:
+    "Not Found" if no ADMIN_KEY is set, just as for a page that doesn't exist, or a 401 for
+    a missing or wrong key. compare_digest takes as long whatever the key sent, so the time
+    a wrong guess takes gives away nothing about how close it was."""
+    if not ADMIN_KEY:
+        return PlainTextResponse("Not Found", status_code=404)
+    given = request.headers.get("authorization", "")
+    if not hmac.compare_digest(given.encode(), ("Bearer " + ADMIN_KEY).encode()):
+        return JSONResponse({"error": "wrong or missing admin key."}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+    return None
+
+
+def database_problem(error):
+    """What went wrong talking to the database, in a few words, for the owner."""
+    if isinstance(error, httpx.HTTPStatusError):
+        text = error.response.text[:300]
+        hint = " run schema.sql in the supabase sql editor to add it." if "name_locked" in text else ""
+        return f"the database answered {error.response.status_code}: {text}{hint}"
+    return "the database couldn't be reached: " + repr(error)
+
+
+def stored_name(wanted):
+    """The name as the leaderboard has it, matching wanted ignoring capitals, or wanted itself
+    if no name on the leaderboard matches (the database then has the last word)."""
+    wanted = wanted.strip()
+    for name in named_points:
+        if name.lower() == wanted.lower():
+            return name
+    return wanted
+
+
+def made_up_name():
+    """A neutral name nobody has, such as player-4821, or None in the unlikely case that every
+    one we try is taken."""
+    taken = {name.lower() for name in named_points}
+    for attempt in range(100):
+        name = f"player-{random.randint(1000, 99999)}"
+        if name not in taken:
+            return name
+    return None
+
+
+async def change_player_by_name(name, changes):
+    """Write changes to the database row of the player with this exact name. Returns the rows
+    changed, as they are now: one, or none if nobody has that name."""
+    response = await db.patch(
+        "/players",
+        params={"name": "eq." + name},
+        json=changes,
+        headers={"Prefer": "return=representation"},
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def moderated(player_id, row):
+    """After the owner changed a player's row, bring the player in memory up to date, if they
+    are there, and send their open pages their new "me" message."""
+    player = players.get(player_id)
+    if player is None:
+        return
+    if player["loaded"] and player["name"]:
+        player["name"], player["name_locked"] = row["name"], bool(row.get("name_locked", False))
+    else:
+        # Their lookup failed, or may still be on its way back with the row as it was before.
+        # Use the row as it is now, and mark them loaded so an older answer is ignored.
+        use_saved_row(player_id, row)
+    send_to_player(player_id, sse("me", player))
+
+
+async def admin_names(request):
+    """Every named player, most points first, with whether their name is locked: so the owner
+    can look over names beyond the top 10. The points are the server's own, which may be newer
+    than the database's. "lock_column" says whether the database has the name_locked column
+    yet (null if there are no players to tell from)."""
+    refusal = admin_refusal(request)
+    if refusal:
+        return refusal
+    try:
+        rows = await read_all_players("*")  # "*" so this works before the name_locked column exists
+    except httpx.HTTPError as error:
+        return JSONResponse({"error": "couldn't read the players. " + database_problem(error)}, status_code=503)
+    listing = [
+        {
+            "name": row["name"],
+            "points": named_points.get(row["name"], row["points"]),
+            "name_locked": bool(row.get("name_locked", False)),
+        }
+        for row in rows
+    ]
+    listing.sort(key=lambda row: (-row["points"], row["name"]))
+    lock_column = ("name_locked" in rows[0]) if rows else None
+    return JSONResponse({"players": listing, "count": len(listing), "lock_column": lock_column})
+
+
+async def admin_rename(request):
+    """Give a player a neutral name and lock it. Send {"name": <their name now>} and, if you
+    like, "to": the new name; without one the server makes one up, such as player-4821.
+    Their points stay with them.
+
+    It works whether or not the player has the page open: the database row is changed first,
+    by name (ignoring capitals), and only if that works is the server's memory changed to match.
+    """
+    refusal = admin_refusal(request)
+    if refusal:
+        return refusal
+    data = await read_json(request)
+    wanted, to = data.get("name"), data.get("to")
+    if not isinstance(wanted, str) or not wanted.strip():
+        return JSONResponse({"error": 'say whose name to change, as "name".'}, status_code=400)
+    if to is not None:
+        if not isinstance(to, str):
+            return JSONResponse({"error": '"to" must be text.'}, status_code=400)
+        to = to.strip()
+        problem = names.name_problem(to)
+        if problem:
+            return JSONResponse({"error": problem}, status_code=400)
+    if not game["ranking_loaded"]:
+        # Until then the startup load could still put the old name back on the leaderboard.
+        return JSONResponse({"error": "the leaderboard hasn't loaded from the database yet. try again in a minute."}, status_code=503)
+
+    async with saving_players:  # so no round's points are saved under the old name meanwhile
+        old_name = stored_name(wanted)
+        for attempt in range(5):
+            new_name = to if to is not None else made_up_name()
+            if new_name is None:
+                return JSONResponse({"error": 'couldn\'t make up a free name. give one as "to".'}, status_code=503)
+            try:
+                rows = await change_player_by_name(old_name, {"name": new_name, "name_locked": True})
+                break
+            except httpx.HTTPError as error:
+                taken = isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 409
+                if taken and to is None:
+                    continue  # someone has the name we made up, though we didn't know: make up another
+                if taken:
+                    return JSONResponse({"error": "that username is taken."}, status_code=409)
+                return JSONResponse({"error": "nothing has changed. " + database_problem(error)}, status_code=503)
+        else:
+            return JSONResponse({"error": 'couldn\'t find a free name. give one as "to".'}, status_code=503)
+        if not rows:
+            return JSONResponse({"error": "nobody is called that."}, status_code=404)
+        row = rows[0]
+        points = named_points.pop(old_name, row["points"])
+        named_points[new_name] = points
+        saved_ids.add(row["id"])
+        moderated(row["id"], row)
+    publish_leaderboard()
+    return JSONResponse({"renamed": old_name, "to": new_name, "points": points, "name_locked": True})
+
+
+async def admin_unlock(request):
+    """Lift the lock on a name, so its player can change it again. Send {"name": <their name>}."""
+    refusal = admin_refusal(request)
+    if refusal:
+        return refusal
+    data = await read_json(request)
+    wanted = data.get("name")
+    if not isinstance(wanted, str) or not wanted.strip():
+        return JSONResponse({"error": 'say whose name to unlock, as "name".'}, status_code=400)
+    async with saving_players:
+        name = stored_name(wanted)
+        try:
+            rows = await change_player_by_name(name, {"name_locked": False})
+        except httpx.HTTPError as error:
+            return JSONResponse({"error": "nothing has changed. " + database_problem(error)}, status_code=503)
+        if not rows:
+            return JSONResponse({"error": "nobody is called that."}, status_code=404)
+        moderated(rows[0]["id"], rows[0])
+    return JSONResponse({"unlocked": rows[0]["name"], "name_locked": False})
 
 
 @contextlib.asynccontextmanager
@@ -895,6 +1200,9 @@ app = Starlette(
         Route("/buy", buy, methods=["POST"]),
         Route("/name", set_name, methods=["POST"]),
         Route("/reset", reset_points, methods=["POST"]),
+        Route("/admin/names", admin_names),
+        Route("/admin/rename", admin_rename, methods=["POST"]),
+        Route("/admin/unlock", admin_unlock, methods=["POST"]),
     ],
     lifespan=lifespan,
 )

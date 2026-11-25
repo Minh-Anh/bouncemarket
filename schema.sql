@@ -7,6 +7,11 @@ create table if not exists players (
   points numeric not null default 10
 );
 
+-- Whether the owner has replaced this player's name and locked it, so they can't change it
+-- themselves (see "Moderating names" in the README). Added after the table was first made,
+-- so it is added here on its own, for tables made before it existed.
+alter table players add column if not exists name_locked boolean not null default false;
+
 -- Names are unique, ignoring capitals, so "Sam" and "sam" can't both exist.
 create unique index if not exists players_name_unique on players (lower(name));
 
@@ -47,3 +52,8 @@ create table if not exists rounds (
 );
 
 alter table rounds enable row level security;
+
+
+-- Ask Supabase's web API to read the tables again, so it knows about any column just added
+-- straight away. (It usually notices by itself; this makes sure.)
+notify pgrst, 'reload schema';

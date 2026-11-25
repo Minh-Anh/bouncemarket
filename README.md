@@ -12,7 +12,7 @@ https://bouncemarket.minhanhday.com/
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-uv installs the Python dependencies (the Starlette web framework, the uvicorn server and the httpx web client, declared at the top of `app.py`) automatically on first run.
+uv installs the Python dependencies automatically on first run: the Starlette web framework, the uvicorn server with its "standard" extras (uvloop, a faster event loop, and httptools, a faster HTTP parser, both used automatically on Linux and macOS), and the httpx web client. Each is pinned to an exact version, at the top of `app.py` for uv and in `requirements.txt` for Render; the two lists must stay the same. The pinned Starlette needs Python 3.11 or newer.
 
 A [Supabase](https://supabase.com) project, which stores the named players and the round log. To set it up:
 
@@ -22,9 +22,12 @@ A [Supabase](https://supabase.com) project, which stores the named players and t
 ```
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your-secret-key
+ADMIN_KEY=a-long-random-key
 ```
 
 Use the secret key (also called the service role key), not the publishable one, and never put it in the page or commit it.
+
+`ADMIN_KEY` is optional. It is the owner's key for moderating names (see [Moderating names](#moderating-names)); without it, the moderation routes don't exist. Make it long and random, for example with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`, and keep it as secret as the database key.
 
 ## Run locally
 
@@ -36,13 +39,15 @@ Then open http://localhost:8000.
 
 ## Deploy
 
-The app is hosted on [Render](https://render.com), which reads `render.yaml`, installs `requirements.txt`, and runs `python app.py`. Every push to `main` redeploys it. `SUPABASE_URL` and `SUPABASE_KEY` are set under Environment in the Render dashboard.
+The app is hosted on [Render](https://render.com), which reads `render.yaml`, installs `requirements.txt`, and runs `python app.py`. Every push to `main` redeploys it. `SUPABASE_URL`, `SUPABASE_KEY` and, optionally, `ADMIN_KEY` are set under Environment in the Render dashboard.
+
+When an update changes `schema.sql`, run it in the Supabase SQL editor before pushing. The old code doesn't mind the additions, and the new code may need them (see [Moderating names](#moderating-names) for what happens if it is pushed first).
 
 ## How to play
 
 Everyone who opens the page watches the same ball and trades in the same market. A new ball drops 5 seconds after the last one lands.
 
-You start with 10 points. Each "Buy 1 share" button buys one share on that side at the price shown. A share pays 1 point if the ball lands on its side and nothing if it doesn't. So a share bought at 0.30 makes 0.70 if it wins and loses 0.30 if it doesn't.
+You start with 10 points. Each "buy 1 share" button buys one share on that side at the price shown. A share pays 1 point if the ball lands on its side and nothing if it doesn't. So a share bought at 0.30 makes 0.70 if it wins and loses 0.30 if it doesn't. While you hold shares, each side's card shows what you would net if the ball lands on that side: your shares on that side minus everything you paid this round.
 
 You can buy only while the ball is falling: from the moment it drops until just before it passes the last row of pins. Shares can't be sold back; you hold them until the ball lands.
 
@@ -50,7 +55,11 @@ The price of a side is its fraction of all the shares bought this round, startin
 
 There is also a counterparty with a simple strategy: it buys one share on whichever half of the board the ball starts in, then keeps buying on whichever half the ball is in at that moment, until betting closes. It buys faster the lower the ball is: once a second with the ball at the top, speeding up to 10 times a second by the bottom of the betting zone, where the ball's position says the most about where it will land. Its buying drifts the price towards the side the ball has been spending its time on, and most strongly towards where it is near the end. The counterparty is also the seller of every share you buy: it keeps what you pay and pays out the winners.
 
-Anyone can play straight away, and is ranked on the leaderboard from the start: until you claim a name you appear as "you", where your points would put you, with a "set username" button. Other people's guests aren't shown, only named players and you. A name can be up to 16 characters. Names are unique, and from then on your points are saved. The pencil button after your name on the leaderboard changes it to any name nobody else is using, and your points stay with you. The circling-arrows button beside your name on the leaderboard starts you over with 10 points, after asking first. It can't be used while you hold shares in the round being played.
+Anyone can play straight away, and is ranked on the leaderboard from the start: until you claim a name you appear as "you", where your points would put you, with a "set username" button. Other people's guests aren't shown, only named players and you. Names are unique, ignoring capitals, and from then on your points are saved. The pencil button after your name on the leaderboard changes it to any name nobody else is using, and your points stay with you.
+
+A username is 1 to 16 plain letters (A to Z, either case), numbers, `-` or `_`, with at least one letter or number. The page drops any other character as you type. Some names are reserved because they would look like the site itself talking (`you`, `guest`, `admin`, `moderator` and the like), and a word filter turns down slurs, obscenities and hate symbols, including the usual disguises such as numbers for letters. The rules are in `names.py`. They are checked only when a name is set or changed, so a name saved before a rule existed stays as it is, unless the owner changes it (see [Moderating names](#moderating-names)). If the owner has changed your name, it is locked and you can't change it yourself.
+
+Anyone can start over with 10 points, whatever they have now, named or not. The circling-arrows button on your own leaderboard row does it, asking first only if you have more than 10 points to lose. If you can't afford a share on either side and hold none, a "reset to 10" button also appears under the buy buttons. A reset can't be used while you hold shares in the round being played, or someone could spend everything pushing a price around, start over, and do it again for free. A guest's reset changes nothing in the database and nothing on anyone else's leaderboard, only their own.
 
 ## How it works
 
@@ -59,8 +68,8 @@ The server runs one game for everyone. It simulates each drop in full the moment
 Every open page holds one stream from the server (as [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)) carrying two kinds of message:
 
 - A public "game" message, identical for every player: the countdown, the price of each side, and while the ball is falling, its next positions. It is sent only as often as needed, because at scale these messages are most of the server's work and bandwidth: twice a second early in a drop, 10 times a second for the last 1.5 seconds before betting closes and until the ball lands, once a second between drops, and straight away when a drop starts or the ball lands.
-- A private "me" message with your name, points and shares, sent when you connect and after each round. Buying a share returns the same information.
-- A "leaderboard" message with the top 10 named players, sent when you connect and after each round. If you're ranked below the top 10, it also has the two players either side of you, which the page shows under a "…" with your row in yellow. The server reads every named player's points from the database once when it starts, then keeps the ranking up to date in memory: it is the only thing that changes anyone's points, so it never needs to read them again.
+- A private "me" message with your name, points and shares, and `name_locked`, which is true if the owner has locked your name, sent when you connect, after each round, and when the owner changes your name. Buying a share, setting a name and resetting return the same information.
+- A "leaderboard" message with the top 10 named players, sent when you connect and after each round. If you're ranked below the top 10, it also has the two players either side of you, which the page shows under a "…" with your row in yellow. The server reads every named player's id and points from the database once when it starts, then keeps the ranking up to date in memory: it is the only thing that changes anyone's points, so it never needs to read them again.
 
 Ball positions are sent early and the page plays them back on its own clock, which keeps the ball moving smoothly when the network delivers messages unevenly. Early in a drop they are sent up to 48 frames (0.8 seconds) early. For the last 1.5 seconds before betting closes, only 12 frames (a fifth of a second) early. Betting closes that fifth of a second before the ball passes the last row, and while betting is open no page is ever sent a position past the last row, so nobody can bet on a result they have already been sent. Positions are rounded to a tenth of a pixel to keep messages short (`POSITION_DECIMALS` in `app.py`).
 
@@ -71,6 +80,56 @@ Your browser remembers a random id that tells the server which player you are. W
 If the database can't be reached, the game carries on: everyone can still play, but names can't be claimed and saved points aren't loaded until it is back.
 
 Players without a name live only in the server's memory, and lose their points when it restarts. Once you claim a name, your id, name and points are a row in the Supabase `players` table. The server saves your points there after every round you play in, and loads them back the next time your browser connects.
+
+The database is asked about a player only when it can't already know the answer. The read at startup gives the server the id of every player with a row, and it adds to that list as players claim names. So once that read has worked, a browser id that isn't on the list is a new visitor with nothing saved, and their page starts without the database being asked anything: a big crowd arriving at once costs the database nothing. A player who does have a row is looked up the first time they connect after a restart, for their name, points and lock, and not again until the next restart. Until the startup read has worked (in the first moment after a restart, or while the database is down, when it is tried again every 30 seconds) the server can't tell newcomers from returning players, so it looks up every player as they connect. Claiming a first name also looks the player up once more just before writing the row, in case the row was written moments ago by the previous server, which keeps running for a little while during a deploy; otherwise the new row would overwrite it.
+
+## Moderating names
+
+The word filter can't catch everything. If a bad name reaches the leaderboard, the owner can replace it straight away, with no restart: the server gives the player a neutral name and locks it, so they can't change it back. Their points stay with them. The lock is the `name_locked` column of the `players` table, so it lasts through restarts.
+
+This needs `ADMIN_KEY` set on the server (see [Requirements](#requirements)). Each request sends it as `Authorization: Bearer <key>`. A missing or wrong key gets `401`, and if `ADMIN_KEY` isn't set at all, the routes answer `404 Not Found`, as if they weren't there. In a terminal, first:
+
+```
+export ADMIN_KEY=the-key-you-set-on-render
+export SITE=https://bouncemarket.minhanhday.com
+```
+
+Every named player with their points and whether their name is locked, most points first, so you can look beyond the top 10:
+
+```
+curl -s "$SITE/admin/names" -H "Authorization: Bearer $ADMIN_KEY"
+```
+
+It answers `{"players": [{"name": "Sam", "points": 42.5, "name_locked": false}, ...], "count": 1, "lock_column": true}`. `lock_column` says whether the database has the `name_locked` column yet (`null` if there are no players to tell from).
+
+Replace a name with one the server makes up, such as `player-4821`, and lock it. The name is matched ignoring capitals, and the player doesn't need to be online:
+
+```
+curl -s -X POST "$SITE/admin/rename" -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" -d '{"name": "TheBadName"}'
+```
+
+Or choose the new name yourself with `"to"`. It must follow the same rules as any username:
+
+```
+curl -s -X POST "$SITE/admin/rename" -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" -d '{"name": "TheBadName", "to": "renamed1"}'
+```
+
+It answers `{"renamed": "TheBadName", "to": "player-4821", "points": 12.5, "name_locked": true}`. The new name is written to the database first; only if that works does the server change the leaderboard for everyone, and the player's own pages, at once. If the database write fails, nothing changes and the answer says why.
+
+Lift a lock, so the player can choose a name again:
+
+```
+curl -s -X POST "$SITE/admin/unlock" -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" -d '{"name": "player-4821"}'
+```
+
+The errors are `400` for a bad request or a `"to"` that breaks the username rules, `404` if nobody has the name, `409` if `"to"` is taken, and `503` if the database can't be reached or the server is still reading the leaderboard after a restart (try again in a minute).
+
+The `name_locked` column must exist before these work: run `schema.sql` again (it only adds what is missing). If the new code runs before the column exists, the game itself is unaffected, as the server reads each player's row without naming the column and treats a missing one as "not locked". Only renaming and unlocking fail, with an answer saying to run `schema.sql`.
+
+Avoid moderating during a deploy: for a minute or so the previous server is still running, and it may save a round's points under the old name, undoing the change. If that happens, rename again once the deploy has finished.
 
 ## The round log
 

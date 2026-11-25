@@ -1,10 +1,23 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <!-- Tells phones to lay the page out at their real width instead of a zoomed-out desktop width. -->
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>bouncemarket</title>
+  <!-- What search results and link previews say about the page. -->
+  <meta name="description" content="a ball will fall. trade on where it lands.">
+  <!-- The color phones give the browser's own bars: the page's background. -->
+  <meta name="theme-color" content="#111111">
+  <!-- The icon on the browser tab: the yellow ball on the page's background. It is written here
+       as a tiny drawing, so the server has no icon file to send. %23 stands for "#". -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111'/><circle cx='16' cy='16' r='7' fill='%23fc3'/></svg>">
+  <!-- What chat and social apps show when someone pastes the link (the "Open Graph" tags). -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="bouncemarket">
+  <meta property="og:description" content="a ball will fall. trade on where it lands.">
+  <meta property="og:url" content="https://bouncemarket.minhanhday.com/">
+  <meta name="twitter:card" content="summary">
   <style>
     /* The whole palette: yellow as the accent, blue for the left side and orange for the right
        (the buy buttons and the odds bar), and three greys. */
@@ -63,7 +76,9 @@
        On a narrow screen the leaderboard doesn't fit beside the game, so it wraps underneath. */
     main { display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-start; gap: 20px; }
     #game { flex: 0 1 400px; display: grid; gap: 10px; }
-    #sidebar { flex: 1 1 260px; display: grid; gap: 10px; }
+    /* min-width 0 and the minmax column let the sidebar be narrower than its longest leaderboard
+       name, which is cut off with "…" instead of pushing the sidebar under the game or off the screen. */
+    #sidebar { flex: 1 1 260px; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 
     /* The board shrinks to fit a small screen, keeping its shape, and never takes more than
        half the screen's height, so the buy buttons stay in view below it. */
@@ -80,6 +95,10 @@
     #market { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .side { display: grid; gap: 4px; }
     .price { font-size: 30px; font-weight: bold; line-height: 1.2; }
+    /* Our holding stays on one line, even with what we'd net added after it, so the card never
+       grows and the buy button below it never moves while someone is tapping it. */
+    .holding { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .net { color: var(--text); }
     .side button {
       margin-top: 6px; padding: 10px 6px; border: none; border-radius: 8px;
       font: inherit; font-weight: bold; color: #111; cursor: pointer;  /* dark text reads better than white on both colors */
@@ -89,6 +108,18 @@
     #left-side button { background: var(--left); }
     #right-side button { background: var(--right); }
     .side button:disabled { opacity: 0.3; cursor: default; }
+
+    /* The line under the cards, with a "reset to 10" button at its right while we're out of
+       points. The line is always as tall as the button, so the button appearing or going away
+       doesn't move anything. */
+    #market-note { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 22px; }
+    #broke-reset {
+      flex: none; padding: 2px 10px; border: none; border-radius: 6px;
+      font: inherit; font-size: 13px; font-weight: bold; line-height: 18px;  /* after font, which would reset it */
+      background: var(--accent); color: #111; cursor: pointer;
+      touch-action: manipulation;
+    }
+    #broke-error:empty { display: none; }  /* only takes up room when a reset was refused */
 
     /* Market odds: each side's share price is the chance the market gives it, shown as a split bar.
        Blue and orange are a validated colorblind-safe pair; the percentages label each side too. */
@@ -103,26 +134,33 @@
 
     #name { width: 100%; font: inherit; padding: 6px 10px; border-radius: 8px; border: none; margin-bottom: 8px; }
 
-    /* The "Claim name" button on a guest's own leaderboard row, after "you". */
+    /* The "set username" button on a guest's own leaderboard row, after "you". */
     #leaderboard .claim-button {
-      margin-left: 8px; padding: 1px 8px; border: 1px solid var(--accent); border-radius: 6px;
+      flex: none; margin-left: 8px; padding: 1px 8px; border: 1px solid var(--accent); border-radius: 6px;
       font: inherit; font-size: 12px; background: none; color: var(--accent); cursor: pointer;
     }
     #leaderboard .claim-button:hover { background: var(--accent); color: #111; }
 
-    /* Each row: its rank (added by the browser), the name, and the points pushed to the right. */
-    #leaderboard { margin: 8px 0 0; padding-left: 24px; }
-    #leaderboard li { padding: 3px 0; text-transform: lowercase; }  /* names are stored as typed, shown in lowercase */
-    #leaderboard .points { float: right; font-weight: bold; }
+    /* Each row, on one line: its rank, the name, and the points pushed to the right. A name too
+       long to fit is cut off with "…", so the points never get pushed onto a line of their own.
+       The ranks are written by showLeaderboard(), not by the browser, so their column can be made
+       as wide as the longest rank shown (--rank-digits), keeping every name lined up. */
+    #leaderboard { margin: 8px 0 0; padding: 0; list-style: none; }
+    #leaderboard li { display: flex; align-items: center; padding: 3px 0; text-transform: lowercase; }  /* names are stored as typed, shown in lowercase */
+    #leaderboard .rank { flex: none; width: calc((var(--rank-digits, 2) + 1.2) * 1ch); text-align: right; padding-right: 0.5ch; }
+    #leaderboard .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #leaderboard .points { flex: none; margin-left: auto; padding-left: 10px; white-space: nowrap; font-weight: bold; }
     #leaderboard .me { color: var(--accent); }
+    #leaderboard-error:not(:empty) { margin-top: 6px; }
     /* The two small buttons on our own row, each just an icon in the row's yellow: a pencil
        right after our name, to change it, and the reset button just left of our points. */
     #leaderboard .reset, #leaderboard .rename {
       padding: 2px; border: none; background: none; color: inherit;
       cursor: pointer; vertical-align: -2px; opacity: 0.7;
+      line-height: 0;  /* just as tall as the icon, so our row is no taller than the others */
     }
     #leaderboard .reset { margin-right: 4px; }
-    #leaderboard .rename { margin-left: 6px; }
+    #leaderboard .rename { flex: none; margin-left: 6px; }
     #leaderboard .reset:hover, #leaderboard .rename:hover { opacity: 1; }
 
     /* The confirmation dialog for a reset. */
@@ -135,7 +173,7 @@
     #reset-cancel, #claim-cancel { background: #333; color: var(--text); }
     #reset-confirm, #claim-confirm { background: var(--accent); color: #111; font-weight: bold; }
 
-    #leaderboard .gap { list-style: none; color: var(--muted); }  /* the "…" between the top 10 and the rows around you */
+    #leaderboard .gap { color: var(--muted); }  /* the "…" between the top 10 and the rows around you */
   </style>
 </head>
 <body>
@@ -162,19 +200,25 @@
           <p class="label">Left</p>
           <p class="muted">price per share</p>
           <p class="price" id="price-left"></p>
-          <p class="muted">you hold <span id="shares-left">0</span></p>
+          <p class="muted holding">you hold <span id="shares-left">0</span><span class="net" id="net-left"></span></p>
           <button data-side="left">buy 1 share</button>
         </div>
         <div class="side panel" id="right-side">
           <p class="label">Right</p>
           <p class="muted">price per share</p>
           <p class="price" id="price-right"></p>
-          <p class="muted">you hold <span id="shares-right">0</span></p>
+          <p class="muted holding">you hold <span id="shares-right">0</span><span class="net" id="net-right"></span></p>
           <button data-side="right">buy 1 share</button>
         </div>
       </div>
 
-      <p class="muted">each winning share pays 1 point.</p>
+      <div>
+        <div id="market-note">
+          <p class="muted">each winning share pays 1 point.</p>
+          <button type="button" id="broke-reset" hidden>reset to 10</button>
+        </div>
+        <p class="muted" id="broke-error"></p>
+      </div>
     </section>
 
     <section id="sidebar">
@@ -191,6 +235,7 @@
           <h2>leaderboard</h2>
         </div>
         <ol id="leaderboard"></ol>
+        <p class="muted" id="leaderboard-error"></p>
       </div>
       <p id="credit-bottom"><a class="credit" href="https://minhanhday.com/code" target="_blank" rel="noopener">created by minh-anh day</a></p>
     </section>
@@ -223,7 +268,9 @@
     <h2 id="claim-title"></h2>
     <p id="claim-text"></p>
     <form id="claim">
-      <input id="name" maxlength="16" placeholder="your username" autocomplete="off">
+      <!-- No capitals, corrections or spelling marks from phone keyboards: a username isn't a word.
+           Characters a username can't have are dropped as they're typed or pasted (see keepAllowed()). -->
+      <input id="name" placeholder="your username" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
       <p class="muted" id="claim-error"></p>
       <div class="dialog-buttons">
         <button type="button" id="claim-cancel">cancel</button>
@@ -332,19 +379,37 @@
       for (const [x, y] of board.pins) circle(x, y, board.pin_r, "#888");
     }
 
+    // A number of points with its sign, e.g. +1.58 or −1.42 (a real minus sign, as wide as the
+    // plus, not a hyphen), or 0.00 with no sign. Rounded first, so a tiny loss never shows as −0.00.
+    const MINUS = String.fromCharCode(0x2212);  // the minus sign, written as its code so it can't be mistaken for a hyphen here
+    function signed(points) {
+      const rounded = Math.round(points * 100) / 100;
+      const sign = rounded > 0 ? "+" : rounded < 0 ? MINUS : "";
+      return sign + Math.abs(rounded).toFixed(2);
+    }
+
     // Show everything except the ball, from the latest public and private messages.
     function render() {
       if (!game || !me) return;
       document.getElementById("online").textContent = `${game.online} online`;  // everyone with the page open, us included
 
       // A share can be bought while betting is open, if we can afford its price.
+      // Once we hold shares this round, each card also shows what we'd net if the ball lands on
+      // its side: every share on that side pays 1, minus everything we paid this round, both sides.
+      const holding = me.shares.left + me.shares.right > 0;
       for (const buyButton of document.querySelectorAll(".side button")) {
         const side = buyButton.dataset.side;
         const price = game.prices[side];
         document.getElementById("price-" + side).textContent = price.toFixed(2);
         document.getElementById("shares-" + side).textContent = me.shares[side];
+        document.getElementById("net-" + side).textContent = holding ? ` · ${signed(me.shares[side] - me.spent)}` : "";
         buyButton.disabled = !game.betting_open || price > me.points;
       }
+
+      // Out of points: we can't afford a share on either side and hold none that could win some
+      // back. Without a way out, both buy buttons would stay grey for good, so we offer a reset.
+      const broke = !holding && game.prices.left > me.points && game.prices.right > me.points;
+      document.getElementById("broke-reset").hidden = !broke;
 
       // Market odds. The two prices always add up to 1, so each is the chance the market gives
       // that side. Rounded so the two percentages still add up to 100.
@@ -365,8 +430,7 @@
       if (game.dropping) {
         status = game.betting_open ? "trading open" : "trading closed";
       } else if (game.last_bucket) {
-        const sign = me.last_won > 0 ? "+" : "";
-        status = `landed ${game.last_bucket} · ${sign}${me.last_won.toFixed(2)} points`;
+        status = `landed ${game.last_bucket} · ${signed(me.last_won)} points`;
       }
       document.getElementById("status").textContent = status;
       document.getElementById("balance").textContent = me.points.toFixed(2);  // updates as soon as we buy
@@ -397,6 +461,38 @@
       };
     }
 
+    // Resetting: start over with 10 points. The server refuses while we hold shares in the round
+    // being played, and its reason is shown in errorText, next to whatever was pressed.
+    // Returns whether it worked.
+    async function resetPoints(errorText) {
+      errorText.textContent = "";
+      const response = await fetch("/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ player: playerId }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        errorText.textContent = result.error;
+        return false;
+      }
+      me = result;
+      clearResetErrors();
+      render();
+      return true;  // the server also sends a new leaderboard with our 10 points on it
+    }
+    function clearResetErrors() {
+      for (const id of ["reset-error", "leaderboard-error", "broke-error"]) document.getElementById(id).textContent = "";
+    }
+
+    // Only ask first when a reset would lose something, that is when we have more than 10 points.
+    // With 10 or fewer there is nothing to lose, so it happens straight away.
+    function askToReset(errorText) {
+      if (me.points > 10) openResetDialog();
+      else resetPoints(errorText);
+    }
+    document.getElementById("broke-reset").onclick = () => askToReset(document.getElementById("broke-error"));
+
     // The reset dialog: start over with 10 points, after saying yes.
     const resetDialog = document.getElementById("reset-dialog");
     function openResetDialog() {
@@ -406,19 +502,7 @@
     }
     document.getElementById("reset-cancel").onclick = () => resetDialog.close();
     document.getElementById("reset-confirm").onclick = async () => {
-      const response = await fetch("/reset", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ player: playerId }),
-      });
-      const result = await response.json();
-      if (response.ok) {
-        me = result;
-        render();
-        resetDialog.close();
-      } else {
-        document.getElementById("reset-error").textContent = result.error;
-      }
+      if (await resetPoints(document.getElementById("reset-error"))) resetDialog.close();
     };
 
     // The name dialog: pick a name, which puts it on the leaderboard in place of "you", or change
@@ -436,6 +520,31 @@
       claimDialog.showModal();
     }
     document.getElementById("claim-cancel").onclick = () => claimDialog.close();
+
+    // A username is 1 to 16 letters (a to z, either case), digits, "-" or "_". Anything else is
+    // dropped as it's typed or pasted, so "mr. bean!" becomes "mrbean", and past 16 characters
+    // the newest ones are dropped. The server still has the final say, and its reason shows
+    // below the box. The text cursor stays where it was, among the characters that are kept.
+    const NAME_LENGTH = 16;
+    const NOT_ALLOWED = /[^A-Za-z0-9_-]/g;
+    const nameInput = document.getElementById("name");
+    function keepAllowed() {
+      const cursor = nameInput.selectionStart ?? nameInput.value.length;
+      let before = nameInput.value.slice(0, cursor).replace(NOT_ALLOWED, "");
+      const after = nameInput.value.slice(cursor).replace(NOT_ALLOWED, "");
+      // Too long: what was just typed or pasted is right before the cursor, so cut it from there.
+      const tooMany = before.length + after.length - NAME_LENGTH;
+      if (tooMany > 0) before = before.slice(0, Math.max(0, before.length - tooMany));
+      const kept = (before + after).slice(0, NAME_LENGTH);
+      if (kept === nameInput.value) return;
+      nameInput.value = kept;
+      nameInput.setSelectionRange(before.length, before.length);
+    }
+    // While a phone keyboard is still composing a word, the box's text isn't final, and changing
+    // it then can garble what's typed. So we wait until the word is done.
+    nameInput.addEventListener("input", (event) => { if (!event.isComposing) keepAllowed(); });
+    nameInput.addEventListener("compositionend", keepAllowed);
+
     document.getElementById("claim").onsubmit = async (event) => {
       event.preventDefault();  // stop the browser reloading the page, its default for forms
       const response = await fetch("/name", {
@@ -456,11 +565,20 @@
 
     // The top players, then, if we're ranked below them, a "…" gap and the players around us.
     function showLeaderboard() {
-      const toRow = (entry) => {
+      // A row starts with its rank, e.g. "45.", in a column of its own (empty for the gap).
+      const newRow = (rank) => {
         const row = document.createElement("li");
-        row.value = entry.rank;  // the number the list shows, so the rows around us show e.g. 45 to 49
+        const rankText = document.createElement("span");
+        rankText.className = "rank";
+        rankText.textContent = rank === null ? "" : rank + ".";
+        row.append(rankText);
+        return row;
+      };
+      const toRow = (entry) => {
+        const row = newRow(entry.rank);
         const name = document.createElement("span");
         const points = document.createElement("span");
+        name.className = "name";
         name.textContent = entry.name ?? "you";  // we're ranked even before claiming a name
         points.textContent = entry.points.toFixed(2);  // always two decimal places, e.g. 10.00
         points.className = "points";
@@ -475,16 +593,18 @@
             claim.textContent = "set username";
             claim.onclick = openNameDialog;
             row.append(claim);
-          } else {
-            // With a name, a small pencil button after it, to change it.
+          } else if (!me?.name_locked) {
+            // With a name, a small pencil button after it, to change it, unless the server says
+            // this name can't be changed.
             const rename = document.getElementById("rename-icon").content.firstElementChild.cloneNode(true);
             rename.onclick = openNameDialog;
             row.append(rename);
-            // And a small reset button just left of the points, which asks before doing anything.
-            const reset = document.getElementById("reset-icon").content.firstElementChild.cloneNode(true);
-            reset.onclick = openResetDialog;
-            points.prepend(reset);
           }
+          // And, named or not, a small reset button just left of the points. It asks first
+          // when there's something to lose (see askToReset()).
+          const reset = document.getElementById("reset-icon").content.firstElementChild.cloneNode(true);
+          reset.onclick = () => askToReset(document.getElementById("leaderboard-error"));
+          points.prepend(reset);
         }
         row.append(points);
         return row;
@@ -493,13 +613,17 @@
       const aroundMe = leaderboard.around_me;
       // Only show the gap if some ranks really are skipped (not when we're 11th or 12th).
       if (aroundMe.length > 0 && aroundMe[0].rank > leaderboard.top.length + 1) {
-        const gap = document.createElement("li");
+        const gap = newRow(null);
         gap.className = "gap";
-        gap.textContent = "…";
+        gap.append("…");
         rows.push(gap);
       }
       rows.push(...aroundMe.map(toRow));
-      document.getElementById("leaderboard").replaceChildren(...rows);
+      // The rank column is as wide as the longest rank shown, so every name starts at the same place.
+      const ranks = [...leaderboard.top, ...aroundMe].map((entry) => String(entry.rank).length);
+      const list = document.getElementById("leaderboard");
+      list.style.setProperty("--rank-digits", Math.max(1, ...ranks));
+      list.replaceChildren(...rows);
     }
 
     // The public "game" message arrives up to 10 times a second: twice a second early in a drop,
@@ -551,7 +675,8 @@
       // "me" message with our name, points and shares, the public "game" message, and the leaderboard.
       // If the connection drops, the browser reconnects by itself.
       const stream = new EventSource("/events?player=" + playerId);
-      stream.addEventListener("me", (event) => { me = JSON.parse(event.data); render(); showLeaderboard(); });
+      // A "me" message comes after each round, which makes any "reset once this round is over" out of date.
+      stream.addEventListener("me", (event) => { me = JSON.parse(event.data); clearResetErrors(); render(); showLeaderboard(); });
       stream.addEventListener("leaderboard", (event) => { leaderboard = JSON.parse(event.data); showLeaderboard(); });
       stream.addEventListener("game", (event) => receiveGame(JSON.parse(event.data)));
       requestAnimationFrame(play);

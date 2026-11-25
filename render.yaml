@@ -11,3 +11,5 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
+      - key: ADMIN_KEY  # optional: the owner's key for moderating names, see the README
+        sync: false
