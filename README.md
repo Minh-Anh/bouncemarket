@@ -51,7 +51,7 @@ You start with 10 points. Each "buy 1 share" button buys one share on that side 
 
 You can buy only while the ball is falling: from the moment it drops until just before it passes the last row of pins. Shares can't be sold back; you hold them until the ball lands.
 
-The price of a side is its fraction of all the shares bought this round, starting at 0.50 each, so the two prices always add up to 1. Every buy pushes that side's price up and the other side's down. Being right early, while a side is still cheap, pays more than piling in once everyone agrees.
+The price of a side is its fraction of all the shares bought this round, counting 3 pretend shares on each side so that both start at 0.50 and the first few buys don't swing it wildly (`SEED_SHARES` in `app.py`). The two prices always add up to 1. Every buy pushes that side's price up and the other side's down. Being right early, while a side is still cheap, pays more than piling in once everyone agrees.
 
 There is also a counterparty with a simple strategy: it buys one share on whichever half of the board the ball starts in, then keeps buying on whichever half the ball is in at that moment, until betting closes. It buys faster the lower the ball is: once a second with the ball at the top, speeding up to 10 times a second by the bottom of the betting zone, where the ball's position says the most about where it will land. Its buying drifts the price towards the side the ball has been spending its time on, and most strongly towards where it is near the end. The counterparty is also the seller of every share you buy: it keeps what you pay and pays out the winners.
 

@@ -55,7 +55,7 @@ COUNTDOWN_SECONDS = 5  # the wait between one ball landing and the next one drop
 LEADERBOARD_SIZE = 10
 NEIGHBORS = 2  # a player ranked below the top 10 also sees this many players either side of them
 PAGE_SIZE = 1000  # the most rows Supabase returns from one request, unless its settings say otherwise
-SEED_SHARES = 1  # pretend shares on each side, so the price starts at 0.50. Fewer makes early buys swing it harder
+SEED_SHARES = 3  # pretend shares on each side, so the price starts at 0.50. Fewer makes early buys swing it harder
 
 # The round log: every round a player bought in is saved to the database, for analysis later.
 # See "The round log" below, and analysis.py, which reads it back.
