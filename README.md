@@ -2,7 +2,7 @@
 
 A ball drops from a random spot in the middle two-thirds of the top, bounces off pins, and lands in one of two buckets. The board is a trapezoid: its walls lean inwards, so the pins get closer together towards the bottom and the ball slows down as it falls.
 
-https://bouncemarket.onrender.com/
+https://bouncemarket.minhanhday.com/
 
 ## Requirements
 
