@@ -640,7 +640,23 @@
       const slot = document.getElementById("best-round");
       slot.hidden = !(card && card.profit > 1);
       if (slot.hidden) return;
-      slot.replaceChildren(bestRoundCard.makeCard(card, { fresh: cardFresh !== null }));
+      slot.replaceChildren(bestRoundCard.makeCard(card, { fresh: cardFresh !== null, onDelete: deleteCard }));
+    }
+
+    // The card's "delete" button, once the player has said yes. Their record starts over, so the
+    // next round over 1.00 makes a new card; links they've shared keep working. The server also
+    // tells our other open pages. Returns whether it worked, for the card to say so if it didn't.
+    async function deleteCard() {
+      const response = await fetch("/card/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ player: playerId }),
+      }).catch(() => null);
+      if (!response || !response.ok) return false;
+      card = null;
+      cardFresh = null;
+      showCard();
+      return true;
     }
 
     // Counts the new best down to ordinary: the card arrives as the ball lands, then the next
@@ -650,7 +666,11 @@
         cardFresh = "dropping";
       } else if (cardFresh === "dropping" && !dropping) {
         cardFresh = null;
-        showCard();
+        // Just the yellow edge and the label go: redrawing the card would lose a "delete this
+        // card?" the player might be in the middle of answering.
+        const shown = document.querySelector("#best-round .bm-card");
+        shown?.classList.remove("bm-fresh");
+        shown?.querySelector(".bm-new")?.remove();
       }
     }
 

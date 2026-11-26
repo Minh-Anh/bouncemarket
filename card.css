@@ -32,6 +32,29 @@
 .bm-share:hover, .bm-fresh .bm-share { background: var(--accent); color: #111; }
 .bm-share:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 
+/* The trash can at the top right of the player's own card, like the leaderboard's pencil and
+   reset icons. Hidden while "new best round" has that spot. Pressing it swaps the card's top
+   row for a question. */
+.bm-trash {
+  flex: none; margin-left: auto; padding: 2px; border: none; background: none; color: var(--muted);
+  cursor: pointer; opacity: 0.7; line-height: 0; touch-action: manipulation;
+}
+.bm-trash:hover { opacity: 1; color: var(--text); }
+.bm-fresh .bm-trash { display: none; }
+.bm-confirm-no {
+  padding: 0; border: none; background: none; font: inherit; font-size: 13px;
+  color: var(--muted); text-decoration: underline; cursor: pointer; touch-action: manipulation;
+}
+.bm-confirm-no:hover { color: var(--text); }
+.bm-confirm { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px 12px; width: 100%; min-height: 29px; }
+.bm-confirm-text { margin-right: auto; font-size: 13px; color: var(--text); }
+.bm-confirm-yes {
+  padding: 3px 10px; border: none; border-radius: 6px; background: var(--right); color: #111;
+  font: inherit; font-size: 13px; font-weight: bold; cursor: pointer; touch-action: manipulation;
+}
+.bm-confirm-yes:disabled, .bm-confirm-no:disabled { opacity: 0.5; cursor: default; }
+.bm-trash:focus-visible, .bm-confirm-no:focus-visible, .bm-confirm-yes:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+
 /* The share menu: opens upwards from the share button, over the card's own lines, so the card
    never changes size and nothing outside it is covered. */
 .bm-share-wrap { position: relative; flex: none; }

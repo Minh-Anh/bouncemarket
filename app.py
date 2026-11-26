@@ -54,7 +54,7 @@ BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the pag
 RULES_VERSION = 2  # saved with each round; change it whenever the pricing or the counterparty changes, so analysis.py replays each round under its own rules
 PRICE_SOFTNESS = 7  # how many more shares one side needs than the other for its price to reach 0.73 (see prices_for()); higher makes each share move the price less
 # The counterparty (see Counterparty): a few pretend traders, buying the way a person would.
-COUNTERPARTY_TRADERS = 5  # how many; one alone can't click fast enough to keep up with the ball near the bottom
+COUNTERPARTY_TRADERS = 5  # how many; one alone can't click fast enough to keep up with the ball near the bottom. Each player who buys takes one's place
 COUNTERPARTY_FULL_LEAN = 0.5  # a ball this far from the middle towards a wall counts as fully on its side (see counterparty_guess())
 COUNTERPARTY_EDGE = 0.03  # if a trader's guess and the price are closer than this, they let the price be
 COUNTERPARTY_FIRST_LOOK_FRAMES = (8, 30)  # frames before a trader first looks after the drop, by chance between the two
@@ -205,6 +205,10 @@ shared_paths = {}
 # with a player's old name could arrive after their change of name, and undo it.
 saving_players = asyncio.Lock()
 
+# Held while writing best-round cards, so a player deleting their card (clear_card()) and a save
+# of new cards (save_cards()) take turns, and a save can't land after a delete and undo it.
+saving_cards = asyncio.Lock()
+
 
 def simulate_drop(start_x, gravity, bounce):
     """Drop one ball from start_x along the top. Returns its state at every frame, as
@@ -323,13 +327,14 @@ async def save_players(rows):
         response.raise_for_status()
 
 
-async def read_all_players(columns, table="/players", order="id"):
+async def read_all_players(columns, table="/players", order="id", where=None):
     """Every row of the players table (or another table), with the columns asked for, e.g.
     "id,name,points", in the order of a column that is unique, so no row is missed or read twice.
+    where picks rows, in the database's form, e.g. {"cleared": "eq.false"}.
     The database hands rows over at most PAGE_SIZE at a time, so we ask page by page."""
     rows = []
     while True:
-        params = {"select": columns, "limit": PAGE_SIZE, "offset": len(rows), "order": order}
+        params = {**(where or {}), "select": columns, "limit": PAGE_SIZE, "offset": len(rows), "order": order}
         response = await db.get(table, params=params)
         response.raise_for_status()
         page = response.json()
@@ -504,6 +509,12 @@ class Counterparty:
     make a burst, and two traders can click in the same frame. One trader alone can't click fast
     enough to keep up with the ball near the bottom; a few together can.
 
+    They make way for real people: each different player who buys this round takes one trader's
+    place, the highest-numbered trader first, so once COUNTERPARTY_TRADERS players have bought, the
+    counterparty has stopped. A trader who has stopped stays stopped for the rest of the round, and
+    the shares they bought stay in the price. Players are counted by their buys, not by who has the
+    page open, as an open page may be nobody watching.
+
     Nobody collects on their shares; they only move the price. They never buy at close_frame or
     after. Each trader's timing has chance in it, from a generator seeded with exactly where the
     ball dropped and the trader's number, and the traders act in the order they come due (the
@@ -518,7 +529,8 @@ class Counterparty:
         self.due = [self.between(number, COUNTERPARTY_FIRST_LOOK_FRAMES) for number in range(COUNTERPARTY_TRADERS)]
         self.buys = []  # every share the traders have bought so far, as [(frame, side)], in order
         self.net = 0  # shares bought on the left minus on the right, by the traders and the players counted so far
-        self.players_counted = 0  # how many of the player buys are counted in net
+        self.players_counted = 0  # how many of the player buys are counted in net and buyers
+        self.buyers = set()  # the different players among them
 
     def between(self, number, frames):
         """A whole number of frames from frames[0] to frames[1], by trader number's chance."""
@@ -527,17 +539,23 @@ class Counterparty:
 
     def advance(self, frame, player_buys):
         """Make every look and click that's due by frame, in order. player_buys are the round's
-        player buys so far, in the round log's form, (frame, _, _, side, ...): a trader acting at
-        frame f sees only those made before f, so the answer is the same whenever it's asked.
-        The traders act in frame order and a player buy is only ever made at the frame it is now,
-        so the player buys are counted as we go, never going back over them."""
+        player buys so far, in the round log's form, (frame, _, player, side, ...), where player is
+        anything that tells players apart (their id here, their key in analysis.py): a trader
+        acting at frame f sees only those made before f, so the answer is the same whenever it's
+        asked. The traders act in frame order and a player buy is only ever made at the frame it is
+        now, so the player buys are counted as we go, never going back over them."""
         while True:
             due, number = min((due, number) for number, due in enumerate(self.due))
             if due > frame or due >= self.close_frame:
                 return
             while self.players_counted < len(player_buys) and player_buys[self.players_counted][0] < due:
-                self.net += 1 if player_buys[self.players_counted][3] == "left" else -1
+                buy = player_buys[self.players_counted]
+                self.net += 1 if buy[3] == "left" else -1
+                self.buyers.add(buy[2])
                 self.players_counted += 1
+            if len(self.buyers) >= COUNTERPARTY_TRADERS - number:
+                self.due[number] = math.inf  # a player has taken this trader's place
+                continue
             gap = counterparty_guess(*self.path[due]) - prices_for_net(self.net)["left"]
             if abs(gap) < COUNTERPARTY_EDGE:
                 self.due[number] = due + self.between(number, COUNTERPARTY_PAUSE_FRAMES)
@@ -845,14 +863,16 @@ def price_line():
 
 def public_record(record):
     """A card's record as anyone may see it: without the player's id, which works like a
-    password, and without the trajectory, which only a replay of the ball would need."""
-    return {key: value for key, value in record.items() if key not in ("player", "trajectory")}
+    password, the trajectory, which only a replay of the ball would need, or whether the player
+    has deleted it from their page."""
+    return {key: value for key, value in record.items() if key not in ("player", "trajectory", "cleared")}
 
 
 def card_message(record, fresh):
-    """The "card" message for a player's own pages. fresh says the round has only just become
-    their best, which the page shows until the next round has been played."""
-    return sse("card", {"card": public_record(record), "fresh": fresh})
+    """The "card" message for a player's own pages: their card, or None for no card. fresh says
+    the round has only just become their best, which the page shows until the next round has
+    been played."""
+    return sse("card", {"card": record and public_record(record), "fresh": fresh})
 
 
 def new_best_rounds():
@@ -893,6 +913,7 @@ def new_best_rounds():
             "profit": profit,
             # The ball's whole path follows from these, so a replay can play it again (see simulate_drop()).
             "trajectory": {"start_x": game["start_x"], "gravity": GRAVITY, "bounce": BOUNCE, "commit_id": COMMIT},
+            "cleared": False,  # True once the player deletes it from their page (see clear_card())
         }
         best_rounds[player_id] = record
         card_holders.add(player_id)
@@ -901,16 +922,16 @@ def new_best_rounds():
         send_to_player(player_id, card_message(record, fresh=True))
 
 
-CARD_COLUMNS = "share_id,player,username,round_started_at,settled_at,outcome,frames,close_frame,trades,prices,cost,payout,profit,trajectory"
+CARD_COLUMNS = "share_id,player,username,round_started_at,settled_at,outcome,frames,close_frame,trades,prices,cost,payout,profit,trajectory,cleared"
 
 
 async def load_card_holders():
-    """Read the id of every player with a card, once, when the server starts, so a new
-    visitor's page can start without asking the database whether they have one (see
-    get_best_round()). If the database can't be reached, we keep trying every 30 seconds."""
+    """Read the id of every player with a card they haven't deleted, once, when the server
+    starts, so a new visitor's page can start without asking the database whether they have one
+    (see get_best_round()). If the database can't be reached, we keep trying every 30 seconds."""
     while True:
         try:
-            rows = await read_all_players("player", table="/best_rounds", order="share_id")
+            rows = await read_all_players("player", table="/best_rounds", order="share_id", where={"cleared": "eq.false"})
         except httpx.HTTPError as error:
             print("Could not load who has a best-round card, trying again in 30 seconds:", repr(error))
             await asyncio.sleep(30)
@@ -923,7 +944,8 @@ async def load_card_holders():
 async def get_best_round(player_id):
     """Make sure we know a player's best round, if they have one, asking the database the first
     time we see them since the server started. Their best is their row with the most profit, the
-    earliest of any with the same, as a later round replaces the best only if it made more.
+    earliest of any with the same, as a later round replaces the best only if it made more,
+    leaving out any they've deleted from their page (see clear_card()).
 
     As in get_player(), once load_card_holders() has read who has a card, anyone else is known
     to have none without asking. If the database can't be reached, we ask again the next time
@@ -937,6 +959,7 @@ async def get_best_round(player_id):
     try:
         response = await db.get("/best_rounds", params={
             "player": "eq." + player_id,
+            "cleared": "eq.false",
             "select": CARD_COLUMNS,
             "order": "profit.desc,settled_at.asc",
             "limit": 1,
@@ -957,16 +980,46 @@ async def get_best_round(player_id):
 async def save_cards():
     """Write every card in unsaved_cards to the best_rounds table. The database skips a card
     it already has, so trying again after a failure that was really a success is harmless."""
-    cards = list(unsaved_cards)  # more may be made while we wait for the database; they are saved next time
-    response = await db.post(
-        "/best_rounds",
-        params={"on_conflict": "share_id"},
-        json=cards,
-        headers={"Prefer": "resolution=ignore-duplicates"},
-    )
-    response.raise_for_status()
-    saved = {card["share_id"] for card in cards}
-    unsaved_cards[:] = [card for card in unsaved_cards if card["share_id"] not in saved]
+    async with saving_cards:
+        cards = list(unsaved_cards)  # more may be made while we wait for the database; they are saved next time
+        response = await db.post(
+            "/best_rounds",
+            params={"on_conflict": "share_id"},
+            json=cards,
+            headers={"Prefer": "resolution=ignore-duplicates"},
+        )
+        response.raise_for_status()
+        saved = {card["share_id"] for card in cards}
+        unsaved_cards[:] = [card for card in unsaved_cards if card["share_id"] not in saved]
+
+
+async def clear_card(request):
+    """Delete a player's card from their page, when they ask. Send {"player": <their id>}.
+
+    Their record starts over: the next round that makes more than CARD_MIN_PROFIT makes a new
+    card. Nothing is removed, though: every card they've had is marked cleared, so it no longer
+    counts as their best, and its share link keeps working for anyone it was sent to.
+    """
+    data = await read_json(request)
+    player_id = parse_id(data.get("player"))
+    if player_id not in players:
+        return JSONResponse({"error": "unknown player."}, status_code=400)
+    async with saving_cards:  # so a save on its way can't land after this and bring a card back
+        try:
+            response = await db.patch(
+                "/best_rounds", params={"player": "eq." + player_id, "cleared": "eq.false"}, json={"cleared": True})
+            response.raise_for_status()
+        except httpx.HTTPError as error:
+            print("Could not clear a card:", repr(error))
+            return JSONResponse({"error": "couldn't delete your card. try again in a minute."}, status_code=503)
+        for card in unsaved_cards:
+            if card["player"] == player_id:
+                card["cleared"] = True
+        best_rounds.pop(player_id, None)
+        card_holders.discard(player_id)
+        best_loaded.add(player_id)  # known now: no card, so a lookup still on its way mustn't bring one back
+    send_to_player(player_id, card_message(None, fresh=False))  # their other open pages too
+    return JSONResponse({"cleared": True})
 
 
 async def save_cards_forever():
@@ -1711,6 +1764,7 @@ app = Starlette(
         Route("/buy", buy, methods=["POST"]),
         Route("/name", set_name, methods=["POST"]),
         Route("/reset", reset_points, methods=["POST"]),
+        Route("/card/clear", clear_card, methods=["POST"]),
         Route("/admin/names", admin_names),
         Route("/admin/rename", admin_rename, methods=["POST"]),
         Route("/admin/unlock", admin_unlock, methods=["POST"]),

@@ -81,6 +81,11 @@ create table if not exists best_rounds (
   trajectory jsonb not null  -- what the ball's path follows from: {"start_x", "gravity", "bounce", "commit_id"}
 );
 
+-- Whether the player has deleted this card from their page. A cleared row no longer counts as
+-- their best round, so their next round over 1.00 makes a new card, but its share link still
+-- works. Added after the table was first made, so it is added here on its own.
+alter table best_rounds add column if not exists cleared boolean not null default false;
+
 -- Makes finding a player's best round fast.
 create index if not exists best_rounds_player on best_rounds (player, profit desc);
 

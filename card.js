@@ -172,6 +172,8 @@
 
   // options.fresh: the round has only just become the best, so the card says so.
   // options.share: false leaves out the share button (the share page has its own way back).
+  // options.onDelete: on the player's own card, adds a small "delete" button; called once
+  // they've said yes, it deletes the card and returns whether that worked.
   function makeCard(record, options = {}) {
     const sides = bySide(record);
     const shares = sides.reduce((total, s) => total + s.shares, 0);
@@ -196,11 +198,57 @@
     const head = el("div", { class: "bm-head" },
       el("p", { class: "bm-profit" }, el("span", { class: "bm-number", text: signed(record.profit) }), el("span", { class: "bm-label", text: "best round" })));
     if (options.fresh) head.append(el("span", { class: "bm-new", text: "new best round" }));
+    if (options.onDelete) head.append(trashButton(head, options.onDelete));
 
     const drawing = chart(record);
     const card = el("div", { class: "bm-card panel" + (options.fresh ? " bm-fresh" : "") }, head, drawing.svg, summary, stats, footer);
     card.setFrame = drawing.setFrame;  // for the replay
     return card;
+  }
+
+  // The trash can at the top right of the player's own card, like the pencil and reset icons on
+  // the leaderboard. While the card is a new best, the "new best round" label has that spot and
+  // the trash can is hidden (see card.css); it shows once the label goes. It asks first, in the
+  // card's top row itself ("delete this card? no / yes, delete"), never in a pop-up over the
+  // game. onDelete does the deleting and says whether it worked; if it didn't, the row says so
+  // and the card stays.
+  function trashButton(head, onDelete) {
+    const button = el("button", { type: "button", class: "bm-trash", "aria-label": "delete this card", title: "delete this card" },
+      el("svg:svg", {
+        viewBox: "0 0 24 24", width: 14, height: 14, fill: "none", stroke: "currentColor", "stroke-width": 2.2,
+        "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true",
+      },
+      el("svg:path", { d: "M3 6h18" }),
+      el("svg:path", { d: "M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" }),
+      el("svg:path", { d: "M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" }),
+      el("svg:path", { d: "M10 11v6" }),
+      el("svg:path", { d: "M14 11v6" })));
+    button.onclick = () => {
+      const yes = el("button", { type: "button", class: "bm-confirm-yes", text: "yes, delete" });
+      const no = el("button", { type: "button", class: "bm-confirm-no", text: "no" });
+      const question = el("span", { class: "bm-confirm", role: "group", "aria-label": "delete this card?" },
+        el("span", { class: "bm-confirm-text", text: "delete this card? shared links keep working." }), no, yes);
+      const back = () => {
+        question.replaceWith(...saved);
+        button.focus();
+      };
+      const saved = [...head.childNodes];
+      head.replaceChildren(question);
+      no.onclick = back;
+      question.addEventListener("keydown", (event) => { if (event.key === "Escape") back(); });
+      yes.onclick = async () => {
+        yes.disabled = no.disabled = true;
+        yes.textContent = "deleting…";
+        if (!(await onDelete())) {
+          question.querySelector(".bm-confirm-text").textContent = "couldn't delete it. try again in a minute.";
+          yes.disabled = no.disabled = false;
+          yes.textContent = "yes, delete";
+        }
+        // If it worked, the page takes the card away.
+      };
+      no.focus();
+    };
+    return button;
   }
 
   // The share button opens a small menu, inside the card so it never covers the board or the
