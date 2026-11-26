@@ -83,8 +83,11 @@ def rounds(db=None):
     - "states": the ball's exact [(x, y, vx, vy)] at every frame, from playing the drop again,
       or None if playing it again didn't give the path that was saved. That happens if the
       physics in app.py has changed since: check out the round's "commit_id" to replay it.
-    - "bot_buys": the counterparty's buys as [(frame, side)], worked out from the path by
-      today's app.py, so they are only right if its counterparty rules haven't changed since.
+    - "bot_buys": the counterparty's buys as [(frame, side)], worked out again under the rules
+      the round was played by (its "rules" version): from the path alone for version 1, and
+      from the path, start_x and the player buys for version 2, today's Counterparty in app.py.
+      They are only right if those rules haven't changed since without a new version.
+    - "prices_for": the pricing the round was played by, as a function like app.prices_for().
     """
     db = db or connect()
     for row in fetch(db, "rounds", "id", limit=ROUNDS_PER_REQUEST):
@@ -94,8 +97,51 @@ def rounds(db=None):
         row["buys"] = app.unpack_buys(from_bytea(row["buys"]))
         states, bucket = app.simulate_drop(row["start_x"], row["gravity"], row["bounce"])
         row["states"] = states if app.positions(states) == row["path"] and bucket == row["bucket"] else None
-        row["bot_buys"] = app.counterparty_buys(row["path"], row["close_frame"])
+        row["bot_buys"] = bot_buys(row)
+        row["prices_for"] = prices_v1 if rules(row) == 1 else app.prices_for
         yield row
+
+
+def rules(row):
+    """Which pricing and counterparty rules a logged round was played by. Rounds logged before
+    the column existed were version 1."""
+    version = row.get("rules", 1)
+    if version not in (1, app.RULES_VERSION):
+        raise SystemExit(f"round {row['id']} was played by rules version {version}, which this version of app.py doesn't have")
+    return version
+
+
+def bot_buys(row):
+    """The counterparty's buys in a logged round, as [(frame, side)], under the rules it was played by."""
+    if rules(row) == 1:
+        return counterparty_v1(row["path"], row["close_frame"])
+    bot = app.Counterparty(row["path"], row["close_frame"], row["start_x"])
+    bot.advance(row["close_frame"], row["buys"])
+    return bot.buys
+
+
+def prices_v1(left, right):
+    """The pricing of version 1 rounds: each side's fraction of all the shares bought, counting
+    3 pretend shares on each side so both started at 0.50."""
+    left, right = left + 3, right + 3
+    left_price = min(0.99, max(0.01, round(left / (left + right), 2)))
+    return {"left": left_price, "right": round(1 - left_price, 2)}
+
+
+def counterparty_v1(path, close_frame):
+    """The counterparty's buys under its first rules, which played every round logged before the
+    counterparty column existed: one share at the drop, then one at a time on whichever half of
+    the board the ball was in, every 60 frames with the ball at the top, speeding up to every 6
+    by its height when betting closed."""
+    bottom = max(1, path[close_frame][1])
+    buys = []
+    frame = 0
+    while frame < close_frame:
+        x, y = path[frame]
+        buys.append((frame, "left" if x < app.WIDTH / 2 else "right"))
+        depth = min(1, max(0, y / bottom))
+        frame += round(60 - (60 - 6) * depth)
+    return buys
 
 
 def names(db=None):
@@ -124,7 +170,7 @@ def buy_lines(entry, name_by_key):
     player_shares = {"left": 0, "right": 0}
     for number, (frame, seen_frame, key, side, price, points) in enumerate(entry["buys"]):
         bot_shares = app.shares_by_frame(entry["bot_buys"], frame)
-        expected = app.prices_for(player_shares["left"] + bot_shares["left"], player_shares["right"] + bot_shares["right"])
+        expected = entry["prices_for"](player_shares["left"] + bot_shares["left"], player_shares["right"] + bot_shares["right"])
         odd_prices += expected[side] != price
         won = side == entry["bucket"]
         lines.append([

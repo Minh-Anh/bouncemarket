@@ -51,15 +51,19 @@ FINAL_STRETCH_FRAMES = 90  # for the last 1.5 seconds before betting closes, and
 EARLY_AHEAD_FRAMES = 48  # before that, send positions this far ahead (0.8 seconds), so a message is needed only every half second
 POSITION_DECIMALS = 1  # ball positions are sent rounded to tenths of a pixel; 0 (whole pixels) is ~15% smaller but may look steppy
 BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the page can play back smoothly
-# The counterparty buys faster as the ball falls: every 60 frames (1 second) with the ball at
-# the top, speeding up to every 6 frames (0.1 seconds) by the bottom of the betting zone.
-COUNTERPARTY_SLOWEST_FRAMES = 60
-COUNTERPARTY_FASTEST_FRAMES = 6
+RULES_VERSION = 2  # saved with each round; change it whenever the pricing or the counterparty changes, so analysis.py replays each round under its own rules
+PRICE_SOFTNESS = 7  # how many more shares one side needs than the other for its price to reach 0.73 (see prices_for()); higher makes each share move the price less
+# The counterparty (see Counterparty): a few pretend traders, buying the way a person would.
+COUNTERPARTY_TRADERS = 5  # how many; one alone can't click fast enough to keep up with the ball near the bottom
+COUNTERPARTY_FULL_LEAN = 0.5  # a ball this far from the middle towards a wall counts as fully on its side (see counterparty_guess())
+COUNTERPARTY_EDGE = 0.03  # if a trader's guess and the price are closer than this, they let the price be
+COUNTERPARTY_FIRST_LOOK_FRAMES = (8, 30)  # frames before a trader first looks after the drop, by chance between the two
+COUNTERPARTY_CLICK_FRAMES = (7, 12)  # frames between a trader's clicks: 5 to 8.5 a second, a person's speed
+COUNTERPARTY_PAUSE_FRAMES = (10, 30)  # frames a trader waits before looking again when the price looks right
 COUNTDOWN_SECONDS = 5  # the wait between one ball landing and the next one dropping
 LEADERBOARD_SIZE = 10
 NEIGHBORS = 2  # a player ranked below the top 10 also sees this many players either side of them
 PAGE_SIZE = 1000  # the most rows Supabase returns from one request, unless its settings say otherwise
-SEED_SHARES = 3  # pretend shares on each side, so the price starts at 0.50. Fewer makes early buys swing it harder
 
 # The round log: every round a player bought in is saved to the database, for analysis later.
 # See "The round log" below, and analysis.py, which reads it back.
@@ -133,7 +137,7 @@ game = {
     "path": None,
     "bucket": None,
     "close_frame": 0,  # betting closes when the ball reaches this frame
-    "counterparty_buys": [],  # the counterparty's buys this drop, as [(frame, side)], from counterparty_buys()
+    "counterparty": None,  # the counterparty for this drop, a Counterparty, which keeps its own buys
     "sent_frames": 0,  # how many frames of the path have been sent to the pages so far
     "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
     "buys": [],  # every player buy this round, in order, for the round log. See buy()
@@ -474,30 +478,79 @@ def betting_open(frame=None):
     return game["dropping"] and frame < game["close_frame"]
 
 
-def counterparty_buys(path, close_frame):
-    """The frames the counterparty buys on this drop, and the side it buys each time.
+def counterparty_guess(x, y):
+    """The counterparty's guess at the chance the ball lands on the left, from where it is now.
 
-    It buys one share at the drop, then keeps buying until betting closes, each time on
-    whichever half of the board the ball is in at that moment. The lower the ball, the
-    sooner the next buy: the wait shrinks in a straight line from COUNTERPARTY_SLOWEST_FRAMES
-    with the ball at the top to COUNTERPARTY_FASTEST_FRAMES with the ball as low as it is
-    when betting closes. So it piles in as the ball nears the bottom, when where the ball
-    is says the most about where it will land. It never buys at close_frame itself.
+    A naive rule: the further the ball is from the middle, and the lower it is, the surer it
+    gets. lean is how far it is from the middle, from 0 in the middle to 1 once it's
+    COUNTERPARTY_FULL_LEAN of the way to a wall (the walls lean in, so it's measured against the
+    board's width at that height). depth is how far down it is, from 0 at the top to 1 at the last
+    row of pins. It goes by the square of depth, which is roughly how the board behaves: high up,
+    where the ball is says little, as it has many pins still to hit; low down, being even a
+    little off the middle says a lot.
     """
-    bottom = max(1, path[close_frame][1])  # how far down the ball is when betting closes
-    buys = []
-    frame = 0
-    while frame < close_frame:
-        x, y = path[frame]
-        buys.append((frame, "left" if x < WIDTH / 2 else "right"))
-        depth = min(1, max(0, y / bottom))  # 0 at the top, 1 at the bottom of the betting zone
-        frame += round(COUNTERPARTY_SLOWEST_FRAMES - (COUNTERPARTY_SLOWEST_FRAMES - COUNTERPARTY_FASTEST_FRAMES) * depth)
-    return buys
+    lean = min(1, abs(WIDTH / 2 - x) / (WIDTH / 2 - wall_inset(y)) / COUNTERPARTY_FULL_LEAN)
+    depth = min(1, max(0, y / LAST_ROW_Y))
+    sure = lean * depth ** 2 / 2
+    return 0.5 + sure if x < WIDTH / 2 else 0.5 - sure
+
+
+class Counterparty:
+    """The counterparty for one drop: COUNTERPARTY_TRADERS pretend traders, so the game is never
+    a dead market with nobody else on. Each does what a person playing might: look at the ball
+    and the price; if the price is off from their guess (counterparty_guess()) by COUNTERPARTY_EDGE
+    or more, click to buy one share of the side that's too cheap and look again a click later, as
+    fast as a person clicks; otherwise look again after a short pause. Several clicks in a row
+    make a burst, and two traders can click in the same frame. One trader alone can't click fast
+    enough to keep up with the ball near the bottom; a few together can.
+
+    Nobody collects on their shares; they only move the price. They never buy at close_frame or
+    after. Each trader's timing has chance in it, from a generator seeded with exactly where the
+    ball dropped and the trader's number, and the traders act in the order they come due (the
+    lower number first in the same frame), each seeing every share bought before that frame. So
+    the same drop with the same player buys always gives the same counterparty buys, and
+    analysis.py can work them out again from the round log.
+    """
+
+    def __init__(self, path, close_frame, start_x):
+        self.path, self.close_frame = path, close_frame
+        self.chances = [random.Random(struct.pack("<dB", start_x, number)) for number in range(COUNTERPARTY_TRADERS)]
+        self.due = [self.between(number, COUNTERPARTY_FIRST_LOOK_FRAMES) for number in range(COUNTERPARTY_TRADERS)]
+        self.buys = []  # every share the traders have bought so far, as [(frame, side)], in order
+        self.net = 0  # shares bought on the left minus on the right, by the traders and the players counted so far
+        self.players_counted = 0  # how many of the player buys are counted in net
+
+    def between(self, number, frames):
+        """A whole number of frames from frames[0] to frames[1], by trader number's chance."""
+        low, high = frames
+        return low + int(self.chances[number].random() * (high - low + 1))
+
+    def advance(self, frame, player_buys):
+        """Make every look and click that's due by frame, in order. player_buys are the round's
+        player buys so far, in the round log's form, (frame, _, _, side, ...): a trader acting at
+        frame f sees only those made before f, so the answer is the same whenever it's asked.
+        The traders act in frame order and a player buy is only ever made at the frame it is now,
+        so the player buys are counted as we go, never going back over them."""
+        while True:
+            due, number = min((due, number) for number, due in enumerate(self.due))
+            if due > frame or due >= self.close_frame:
+                return
+            while self.players_counted < len(player_buys) and player_buys[self.players_counted][0] < due:
+                self.net += 1 if player_buys[self.players_counted][3] == "left" else -1
+                self.players_counted += 1
+            gap = counterparty_guess(*self.path[due]) - prices_for_net(self.net)["left"]
+            if abs(gap) < COUNTERPARTY_EDGE:
+                self.due[number] = due + self.between(number, COUNTERPARTY_PAUSE_FRAMES)
+                continue
+            side = "left" if gap > 0 else "right"
+            self.buys.append((due, side))
+            self.net += 1 if side == "left" else -1
+            self.due[number] = due + self.between(number, COUNTERPARTY_CLICK_FRAMES)
 
 
 def shares_by_frame(buys, frame):
     """How many shares have been bought on each side up to and including a frame, given the
-    buys so far as [(frame, side)] in frame order, the form counterparty_buys() returns."""
+    buys so far as [(frame, side)] in frame order, the form Counterparty.buys has."""
     shares = {"left": 0, "right": 0}
     for buy_frame, side in buys:
         if buy_frame > frame:
@@ -510,24 +563,34 @@ def counterparty_shares(frame=None):
     """How many shares the counterparty has bought on each side so far this round: up to the
     frame given, or up to right now if none is.
 
-    It never collects on them. They only move the price, towards the side the ball has been
-    spending its time on, and most of all towards where it has been lately.
+    It never collects on them. They only move the price, towards its guess at where the ball
+    will land. Its buys are worked out as they come due, here, before any price is given.
     """
     if not game["dropping"]:
         return {"left": 0, "right": 0}
-    return shares_by_frame(game["counterparty_buys"], current_frame() if frame is None else frame)
+    frame = current_frame() if frame is None else frame
+    game["counterparty"].advance(frame, game["buys"])
+    return shares_by_frame(game["counterparty"].buys, frame)
 
 
 def prices_for(left, right):
-    """What one share on each side costs once this many shares have been bought on each side.
-    A share pays 1 point if its side wins.
+    """What one share on each side costs once this many shares have been bought on each side,
+    by players and the counterparty. A share pays 1 point if its side wins. See prices_for_net()."""
+    return prices_for_net(left - right)
 
-    The price of a side is its fraction of all the shares bought this round, by players and
-    by the counterparty. So a side that everyone is buying gets expensive, and the two
+
+def prices_for_net(net):
+    """What one share on each side costs when net more shares have been bought on the left than
+    on the right (fewer, if net is below 0).
+
+    Only the difference counts, as in a real market, where buying one side is the same as
+    someone selling it to you: a buy on the left and a buy on the right cancel out. So a share
+    moves the price as much at the end of a round as at the start, however much has been bought
+    before. The two sides start at 0.50, and a side PRICE_SOFTNESS shares ahead costs 0.73, one
+    twice that far ahead 0.88 (a logistic curve, the one prediction-market makers use). The two
     prices always add up to 1.
     """
-    left, right = left + SEED_SHARES, right + SEED_SHARES
-    left_price = round(left / (left + right), 2)
+    left_price = round(1 / (1 + math.exp(-net / PRICE_SOFTNESS)), 2)
     left_price = min(0.99, max(0.01, left_price))  # never free, and never a sure loss
     return {"left": left_price, "right": round(1 - left_price, 2)}
 
@@ -689,6 +752,7 @@ def round_log():
         "close_frame": game["close_frame"],
         "bucket": game["bucket"],
         "format": LOG_FORMAT,
+        "rules": RULES_VERSION,
         "path": to_bytea(pack_path(game["path"])),
         "buys": game["buys"],
     }
@@ -763,7 +827,8 @@ def price_line():
     The right side's price is always 1 minus it. In a round with more than PRICE_POINTS
     changes, the price at PRICE_POINTS evenly spaced frames instead."""
     close = game["close_frame"]
-    buys = sorted([*game["counterparty_buys"], *((buy[0], buy[3]) for buy in game["buys"])])
+    game["counterparty"].advance(close, game["buys"])  # all its buys, up to the close
+    buys = sorted([*game["counterparty"].buys, *((buy[0], buy[3]) for buy in game["buys"])])
     shares = {"left": 0, "right": 0}
     left = []  # the left price at every frame, after that frame's buys
     taken = 0
@@ -1090,7 +1155,7 @@ async def run_rounds():
             path=path,
             bucket=bucket,
             close_frame=close_frame,
-            counterparty_buys=counterparty_buys(path, close_frame),
+            counterparty=Counterparty(path, close_frame, start_x),
             sent_frames=0,
             buys=[],
         )

@@ -53,6 +53,11 @@ create table if not exists rounds (
 
 alter table rounds enable row level security;
 
+-- Which pricing and counterparty rules the round was played by (RULES_VERSION in app.py), so
+-- analysis.py works out its prices and counterparty buys under the right ones. Rounds logged
+-- before it existed were version 1: see prices_v1() and counterparty_v1() in analysis.py.
+alter table rounds add column if not exists rules smallint not null default 1;
+
 
 -- The best-round card. See "The best-round card" in the README.
 
