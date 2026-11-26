@@ -1,5 +1,5 @@
 # /// script
-# dependencies = ["httpx==0.28.1", "starlette==1.10.0", "uvicorn[standard]==0.54.0"]  # keep in sync with requirements.txt
+# dependencies = ["httpx==0.28.1", "pillow==12.0.0", "starlette==1.10.0", "uvicorn[standard]==0.54.0"]  # keep in sync with requirements.txt
 # ///
 import argparse
 import asyncio
@@ -7,10 +7,13 @@ import bisect
 import contextlib
 import datetime
 import hmac
+import html
 import json
 import math
 import os
 import random
+import re
+import secrets
 import struct
 import time
 import uuid
@@ -19,9 +22,10 @@ import zlib
 import httpx
 import uvicorn
 from starlette.applications import Starlette
-from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+import card_image  # card_image.py, in this folder: draws the best-round card as a picture for link previews
 import names  # names.py, in this folder: the rules for usernames
 
 # Board geometry, in pixels. (0, 0) is the top-left corner.
@@ -64,6 +68,17 @@ COMMIT = os.environ.get("RENDER_GIT_COMMIT", "local")  # which version of this c
 UNSAVED_ROUNDS_KEPT = 20  # if the database can't be reached, this many rounds wait in memory, and older ones are dropped
 KEYS_PER_REQUEST = 500  # the most players whose keys (see player_keys) are asked for in one request to the database
 NOT_SEEN = 0xFFFF  # stands in for the frame a page was showing when it didn't say
+
+# The best-round card: each player's best single round, which they can share. See "The
+# best-round card" below, card.js, which draws it, and card_image.py, which draws its picture.
+CARD_MIN_PROFIT = 1.00  # a round makes a card only if it made more than this
+PRICE_POINTS = 200  # the most points of a round's price line a card keeps
+UNSAVED_CARDS_KEPT = 1000  # if the database can't be reached, this many cards wait in memory, and older ones are dropped
+SHARED_KEPT = 500  # how many cards that share pages asked for are kept in memory, so a popular link doesn't ask the database every time
+IMAGES_KEPT = 100  # how many link-preview pictures are kept in memory once drawn
+PATHS_KEPT = 100  # how many replays' ball paths are kept in memory once worked out
+SITE = "bouncemarket.minhanhday.com"  # where to play, written on the card's picture
+SHARE_ID = re.compile(r"[A-Za-z0-9_-]{8}")  # what secrets.token_urlsafe(6) makes: 6 random bytes as 8 characters
 
 
 def wall_inset(y):
@@ -128,6 +143,7 @@ game = {
     "minus_points": [],  # minus each player's points, in "ranking" order, so it ascends for bisect
     "ranking_loaded": False,  # whether load_ranking() has read the whole players table yet
     "update_at": None,  # when the owner has announced a system update for (see admin_notice()), or None
+    "card_holders_loaded": False,  # whether load_card_holders() has read the best_rounds table yet
 }
 
 # One entry per player who has opened the page since the server started, keyed by the
@@ -159,6 +175,26 @@ player_keys = {}
 
 # Rounds waiting to be saved to the round log, oldest first, each as made by round_log().
 unsaved_rounds = []
+
+# The best-round card. Each player's best round so far, {player_id: record}, for the players
+# whose best we know, each record as made by new_best_rounds(). Only a round that made more
+# than CARD_MIN_PROFIT is ever here.
+best_rounds = {}
+# The players whose best round get_best_round() has looked up since the server started, or
+# knows they have none, so the database is asked about each player at most once.
+best_loaded = set()
+# The id of every player with a row in the best_rounds table: read by load_card_holders() when
+# the server starts, and added to whenever a player gets a card. Like saved_ids, it lets a new
+# visitor's page start without asking the database whether they have a card.
+card_holders = set()
+# Cards waiting to be saved to the best_rounds table, oldest first.
+unsaved_cards = []
+# Cards that share pages have asked the database for lately, {share_id: record}, oldest first,
+# and the link-preview pictures drawn from them, {share_id: PNG bytes}.
+shared_records = {}
+shared_images = {}
+# The ball's path for cards whose replay was asked for lately, {share_id: [[x, y], ...]}.
+shared_paths = {}
 
 # Held while writing to the players table, so there is only ever one write on its way to the
 # database, made from the names as they are at that moment. Without it, a round's points sent
@@ -283,13 +319,14 @@ async def save_players(rows):
         response.raise_for_status()
 
 
-async def read_all_players(columns):
-    """Every row of the players table, with the columns asked for, e.g. "id,name,points".
+async def read_all_players(columns, table="/players", order="id"):
+    """Every row of the players table (or another table), with the columns asked for, e.g.
+    "id,name,points", in the order of a column that is unique, so no row is missed or read twice.
     The database hands rows over at most PAGE_SIZE at a time, so we ask page by page."""
     rows = []
     while True:
-        params = {"select": columns, "limit": PAGE_SIZE, "offset": len(rows), "order": "id"}
-        response = await db.get("/players", params=params)
+        params = {"select": columns, "limit": PAGE_SIZE, "offset": len(rows), "order": order}
+        response = await db.get(table, params=params)
         response.raise_for_status()
         page = response.json()
         rows += page
@@ -711,6 +748,329 @@ async def save_round_logs():
             await asyncio.sleep(30)
 
 
+# The best-round card. Each player has one: their best single round, for them to show off
+# outside the game. A round becomes the best when it settles with a profit of more than
+# CARD_MIN_PROFIT and more than the player's best so far (a tie doesn't replace it). The card is
+# a record of the round, made here from the buys the server took itself: nothing a page sends
+# can make or change one. Each record is a row of the best_rounds table, and stays there when a
+# better round replaces it, so the link to it keeps working. card.js draws it, on the player's
+# own page and on the public page at /r/<share_id>.
+
+
+def price_line():
+    """The left side's price over the round that just finished, from the drop until trading
+    closed, as [[frame, price]]: the first frame, then every frame where the price changed.
+    The right side's price is always 1 minus it. In a round with more than PRICE_POINTS
+    changes, the price at PRICE_POINTS evenly spaced frames instead."""
+    close = game["close_frame"]
+    buys = sorted([*game["counterparty_buys"], *((buy[0], buy[3]) for buy in game["buys"])])
+    shares = {"left": 0, "right": 0}
+    left = []  # the left price at every frame, after that frame's buys
+    taken = 0
+    for frame in range(close + 1):
+        while taken < len(buys) and buys[taken][0] <= frame:
+            shares[buys[taken][1]] += 1
+            taken += 1
+        left.append(prices_for(shares["left"], shares["right"])["left"])
+    points = [[frame, price] for frame, price in enumerate(left) if frame == 0 or price != left[frame - 1]]
+    if len(points) > PRICE_POINTS:
+        points = [[frame, left[frame]] for frame in (round(i * close / (PRICE_POINTS - 1)) for i in range(PRICE_POINTS))]
+    return points
+
+
+def public_record(record):
+    """A card's record as anyone may see it: without the player's id, which works like a
+    password, and without the trajectory, which only a replay of the ball would need."""
+    return {key: value for key, value in record.items() if key not in ("player", "trajectory")}
+
+
+def card_message(record, fresh):
+    """The "card" message for a player's own pages. fresh says the round has only just become
+    their best, which the page shows until the next round has been played."""
+    return sse("card", {"card": public_record(record), "fresh": fresh})
+
+
+def new_best_rounds():
+    """After a round is settled: make a card for every player whose round made more than
+    CARD_MIN_PROFIT and more than their best round so far, and send it to their open pages.
+
+    It works from game["buys"], the buys the server took itself, at the frame and price the
+    server charged. The cost is everything a player paid this round, on both sides, and the
+    payout is 1 for each of their shares on the side the ball landed on, so buys on both sides
+    are netted into one profit. A losing round can never make a card, as its profit is below 0.
+    """
+    trades = {}  # {player_id: [[frame, side, price, shares], ...]}
+    for frame, seen_frame, player_id, side, price, points in game["buys"]:
+        trades.setdefault(player_id, []).append([frame, side, price, 1])
+    settled_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    line = None  # worked out only if someone gets a card
+    for player_id, theirs in trades.items():
+        cost = round(sum(price * shares for frame, side, price, shares in theirs), 2)
+        payout = sum(shares for frame, side, price, shares in theirs if side == game["bucket"])
+        profit = round(payout - cost, 2)
+        best = best_rounds.get(player_id)
+        if profit <= CARD_MIN_PROFIT or (best and profit <= best["profit"]):
+            continue
+        line = line or price_line()
+        record = {
+            "share_id": secrets.token_urlsafe(6),
+            "player": player_id,
+            "username": players[player_id]["name"],
+            "round_started_at": datetime.datetime.fromtimestamp(game["started_at"], datetime.timezone.utc).isoformat(),
+            "settled_at": settled_at,
+            "outcome": game["bucket"],
+            "frames": len(game["path"]),
+            "close_frame": game["close_frame"],
+            "trades": theirs,
+            "prices": line,
+            "cost": cost,
+            "payout": payout,
+            "profit": profit,
+            # The ball's whole path follows from these, so a replay can play it again (see simulate_drop()).
+            "trajectory": {"start_x": game["start_x"], "gravity": GRAVITY, "bounce": BOUNCE, "commit_id": COMMIT},
+        }
+        best_rounds[player_id] = record
+        card_holders.add(player_id)
+        unsaved_cards.append(record)
+        del unsaved_cards[:-UNSAVED_CARDS_KEPT]
+        send_to_player(player_id, card_message(record, fresh=True))
+
+
+CARD_COLUMNS = "share_id,player,username,round_started_at,settled_at,outcome,frames,close_frame,trades,prices,cost,payout,profit,trajectory"
+
+
+async def load_card_holders():
+    """Read the id of every player with a card, once, when the server starts, so a new
+    visitor's page can start without asking the database whether they have one (see
+    get_best_round()). If the database can't be reached, we keep trying every 30 seconds."""
+    while True:
+        try:
+            rows = await read_all_players("player", table="/best_rounds", order="share_id")
+        except httpx.HTTPError as error:
+            print("Could not load who has a best-round card, trying again in 30 seconds:", repr(error))
+            await asyncio.sleep(30)
+            continue
+        card_holders.update(row["player"] for row in rows)
+        game["card_holders_loaded"] = True
+        return
+
+
+async def get_best_round(player_id):
+    """Make sure we know a player's best round, if they have one, asking the database the first
+    time we see them since the server started. Their best is their row with the most profit, the
+    earliest of any with the same, as a later round replaces the best only if it made more.
+
+    As in get_player(), once load_card_holders() has read who has a card, anyone else is known
+    to have none without asking. If the database can't be reached, we ask again the next time
+    the player connects; meanwhile a new best they make is still kept and shown.
+    """
+    if player_id in best_loaded:
+        return
+    if game["card_holders_loaded"] and player_id not in card_holders:
+        best_loaded.add(player_id)
+        return
+    try:
+        response = await db.get("/best_rounds", params={
+            "player": "eq." + player_id,
+            "select": CARD_COLUMNS,
+            "order": "profit.desc,settled_at.asc",
+            "limit": 1,
+        })
+        response.raise_for_status()
+    except httpx.HTTPError as error:
+        print("Could not load a best round:", repr(error))
+        return
+    rows = response.json()
+    if player_id in best_loaded:
+        return  # another request for the same player finished first
+    best_loaded.add(player_id)
+    # A round played while we waited may already have made a better card.
+    if rows and (player_id not in best_rounds or rows[0]["profit"] > best_rounds[player_id]["profit"]):
+        best_rounds[player_id] = rows[0]
+
+
+async def save_cards():
+    """Write every card in unsaved_cards to the best_rounds table. The database skips a card
+    it already has, so trying again after a failure that was really a success is harmless."""
+    cards = list(unsaved_cards)  # more may be made while we wait for the database; they are saved next time
+    response = await db.post(
+        "/best_rounds",
+        params={"on_conflict": "share_id"},
+        json=cards,
+        headers={"Prefer": "resolution=ignore-duplicates"},
+    )
+    response.raise_for_status()
+    saved = {card["share_id"] for card in cards}
+    unsaved_cards[:] = [card for card in unsaved_cards if card["share_id"] not in saved]
+
+
+async def save_cards_forever():
+    """Save each new card a moment after it's made, for as long as the server runs. If the
+    database can't be reached, the cards wait in unsaved_cards and we try every 30 seconds.
+    A card that isn't saved yet still works: share pages look in unsaved_cards first."""
+    while True:
+        await asyncio.sleep(1)
+        if not unsaved_cards:
+            continue
+        try:
+            await save_cards()
+        except httpx.HTTPError as error:
+            print("Could not save best-round cards, trying again in 30 seconds:", repr(error))
+            await asyncio.sleep(30)
+
+
+def remember(cache, key, value, kept):
+    """Keep value in cache, a dict used oldest first, dropping the oldest beyond kept."""
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > kept:
+        del cache[next(iter(cache))]
+
+
+async def find_card(share_id):
+    """The card with this share id, or None if there isn't one. Looks in memory first, at the
+    cards not saved yet and the ones share pages asked for lately, then asks the database.
+    Raises httpx.HTTPError if it has to ask and the database can't be reached."""
+    if not SHARE_ID.fullmatch(share_id):
+        return None
+    if share_id in shared_records:
+        return shared_records[share_id]
+    for card in unsaved_cards:
+        if card["share_id"] == share_id:
+            return card
+    response = await db.get("/best_rounds", params={"share_id": "eq." + share_id, "select": CARD_COLUMNS})
+    response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return None
+    remember(shared_records, share_id, rows[0], SHARED_KEPT)
+    return rows[0]
+
+
+def by_side(record):
+    """Each side a card's player bought, in the order left, right: how many shares, and the
+    average price paid, as [(side, shares, average)]."""
+    sides = []
+    for name in ("left", "right"):
+        bought = [(price, shares) for frame, side, price, shares in record["trades"] if side == name]
+        if bought:
+            count = sum(shares for price, shares in bought)
+            sides.append((name, count, sum(price * shares for price, shares in bought) / count))
+    return sides
+
+
+def two_places(number):
+    """A number to two decimal places, halves rounded up, the same as card.js does it."""
+    return f"{math.floor(number * 100 + 0.5) / 100:.2f}"
+
+
+def what_happened(record):
+    """What a card's player bought and where the ball landed, e.g.
+    "bought Left x6 at avg 0.14, landed Left", or with both sides,
+    "bought Left x5 at avg 0.23 and Right x2 at avg 0.50, landed Left"."""
+    bought = " and ".join(f"{side.capitalize()} x{shares} at avg {two_places(average)}" for side, shares, average in by_side(record))
+    return f"bought {bought}, landed {record['outcome'].capitalize()}"
+
+
+def share_text(record):
+    """The line the share button sends before the link, as card.js writes it:
+    "bouncemarket: bought Left x6 at avg 0.14, landed Left, +5.16 in one round"."""
+    return f"bouncemarket: {what_happened(record)}, +{two_places(record['profit'])} in one round"
+
+
+def site_origin(request):
+    """The address the site was reached at, such as https://bouncemarket.minhanhday.com, for the
+    links in a share page's preview tags, which must be whole addresses. Render answers every
+    request over https, but passes it on to us as plain http, saying so in X-Forwarded-Proto."""
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    return f"{scheme}://{request.headers.get('host', request.url.netloc)}"
+
+
+async def share_page(request):
+    """The public page for one card, /r/<share_id>: the card, read-only, and a button to play.
+    Anyone can open it, with nothing remembered. Its preview tags give chat and social apps a
+    title, a line of text and a picture of the card (see share_image()) for when the link is posted."""
+    share_id = request.path_params["share_id"]
+    try:
+        record = await find_card(share_id)
+    except httpx.HTTPError as error:
+        print("Could not load a shared card:", repr(error))
+        record, status = None, 503
+    else:
+        status = 200 if record else 404
+    origin = site_origin(request)
+    if record:
+        title = f"+{two_places(record['profit'])} in one round on bouncemarket"
+        description = what_happened(record) + "."
+        image = f"{origin}/r/{share_id}.png"
+    else:
+        title, description, image = "bouncemarket", "a ball will fall. trade on where it lands.", ""
+    message = {404: "this round can't be found.", 503: "this round can't be loaded right now. try again in a minute."}.get(status, "")
+    with open("share.html") as file:
+        page = file.read()
+    # The card goes in as JSON, with "<" written as < so nothing in it can end the script tag early.
+    card = json.dumps(public_record(record) if record else None).replace("<", "\\u003c")
+    for key, value in {
+        "title": title, "description": description, "url": f"{origin}/r/{share_id}", "image": image, "message": message,
+    }.items():
+        page = page.replace("{{" + key + "}}", html.escape(value))
+    page = page.replace("{{image_tags}}", "" if not record else (
+        f'<meta property="og:image" content="{html.escape(image)}">\n'
+        '  <meta property="og:image:width" content="1200">\n'
+        '  <meta property="og:image:height" content="630">\n'
+        f'  <meta property="og:image:alt" content="{html.escape(description)}">\n'
+        f'  <meta name="twitter:image" content="{html.escape(image)}">'
+    ))
+    page = page.replace("{{card}}", card)  # last, so nothing in the card is taken for a {{...}} to fill in
+    return HTMLResponse(page, status_code=status, headers={"Cache-Control": "public, max-age=300"})
+
+
+async def share_image(request):
+    """The card as a 1200 by 630 picture, /r/<share_id>.png, for link previews and for the
+    share menu's "copy image". Drawn by
+    card_image.py the first time it's asked for, in a thread of its own so the game doesn't
+    wait, then kept in memory for the next time."""
+    share_id = request.path_params["share_id"]
+    if share_id not in shared_images:
+        try:
+            record = await find_card(share_id)
+        except httpx.HTTPError as error:
+            print("Could not load a shared card:", repr(error))
+            return PlainTextResponse("try again in a minute", status_code=503)
+        if record is None:
+            return PlainTextResponse("Not Found", status_code=404)
+        # The picture says where to play (SITE, not the address the request came in at: the
+        # picture is kept for everyone, so no one request may choose what it says).
+        remember(shared_images, share_id, await asyncio.to_thread(card_image.render, record, SITE), IMAGES_KEPT)
+    return Response(shared_images[share_id], media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
+async def share_replay(request):
+    """The ball's path for a card's round, /r/<share_id>/replay, as {"path": [[x, y], ...]}, one
+    position a frame, for the replay on the share page.
+
+    It isn't stored: the record keeps the start_x, gravity and bounce the whole path follows from,
+    and the drop is played again here (see simulate_drop()), which takes a few hundredths of a
+    second. If the physics has changed since, so that the drop no longer lasts as long or lands
+    on the same side, the answer is 404 and the share page shows the card without a replay.
+    """
+    share_id = request.path_params["share_id"]
+    if share_id not in shared_paths:
+        try:
+            record = await find_card(share_id)
+        except httpx.HTTPError as error:
+            print("Could not load a shared card:", repr(error))
+            return JSONResponse({"error": "try again in a minute."}, status_code=503)
+        if record is None:
+            return JSONResponse({"error": "no such round."}, status_code=404)
+        seed = record["trajectory"]
+        states, bucket = simulate_drop(seed["start_x"], seed["gravity"], seed["bounce"])
+        if bucket != record["outcome"] or len(states) != record["frames"]:
+            return JSONResponse({"error": "this round can't be replayed."}, status_code=404)
+        remember(shared_paths, share_id, positions(states), PATHS_KEPT)
+    return JSONResponse({"path": shared_paths[share_id]}, headers={"Cache-Control": "public, max-age=86400"})
+
+
 async def run_rounds():
     """The round loop: wait for the countdown, drop a ball, wait for it to land, pay out. Forever."""
     while True:
@@ -736,6 +1096,7 @@ async def run_rounds():
         )
         await asyncio.sleep(len(path) * FRAME_SECONDS)
         rows = settle()
+        new_best_rounds()
         log = round_log()
         if log:
             # save_round_logs() writes it to the database in its own time, so a slow database never holds up the game.
@@ -830,6 +1191,22 @@ async def index(request):
     return FileResponse("index.html")
 
 
+async def card_script(request):
+    return FileResponse("card.js", media_type="text/javascript")
+
+
+async def card_style(request):
+    return FileResponse("card.css", media_type="text/css")
+
+
+async def board_script(request):
+    return FileResponse("board.js", media_type="text/javascript")
+
+
+async def replay_script(request):
+    return FileResponse("replay.js", media_type="text/javascript")
+
+
 async def board(request):
     return JSONResponse({
         "width": WIDTH,
@@ -849,12 +1226,14 @@ async def events(request):
     The page gets a private "me" message (its name, points and shares) when it connects and
     after each round, the public "game" message from broadcast(), and its own "leaderboard"
     message (the top players, plus the players around it) when it connects and whenever the
-    leaderboard is refreshed.
+    leaderboard is refreshed. If the player has a best-round card, a "card" message brings it
+    when the page connects, and again whenever a round becomes their new best.
     """
     player_id = parse_id(request.query_params.get("player"))
     if player_id is None:
         return JSONResponse({"error": "bad player id."}, status_code=400)
     player = await get_player(player_id)
+    await get_best_round(player_id)
 
     async def stream():
         queue = asyncio.Queue(maxsize=100)
@@ -862,6 +1241,8 @@ async def events(request):
         try:
             yield sse("me", player)
             yield leaderboard_message(player)
+            if player_id in best_rounds:
+                yield card_message(best_rounds[player_id], fresh=False)
             while True:
                 yield await queue.get()
         finally:
@@ -1160,7 +1541,31 @@ async def admin_rename(request):
         saved_ids.add(row["id"])
         moderated(row["id"], row)
     publish_leaderboard()
-    return JSONResponse({"renamed": old_name, "to": new_name, "points": points, "name_locked": True})
+    cards = await rename_cards(row["id"], new_name)
+    return JSONResponse({"renamed": old_name, "to": new_name, "points": points, "name_locked": True, "cards": cards})
+
+
+async def rename_cards(player_id, name):
+    """After the owner has renamed a player, put the new name on all their best-round cards too,
+    old ones included, so a bad name doesn't live on in share pages and link previews. A card
+    made while the player was a guest has no name, and keeps none. Returns "renamed", or what
+    went wrong; the player's rename itself has worked either way."""
+    for card in [best_rounds.get(player_id), *unsaved_cards, *shared_records.values()]:
+        if card and card["player"] == player_id and card["username"] is not None:
+            card["username"] = name
+    shared_images.clear()  # pictures of the old name; they are drawn again when asked for
+    try:
+        response = await db.patch(
+            "/best_rounds",
+            params={"player": "eq." + player_id, "username": "not.is.null"},
+            json={"username": name},
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as error:
+        return "the cards in the database still have the old name; rename them again to try again. " + database_problem(error)
+    if player_id in best_rounds:
+        send_to_player(player_id, card_message(best_rounds[player_id], fresh=False))
+    return "renamed"
 
 
 async def admin_unlock(request):
@@ -1219,7 +1624,7 @@ async def lifespan(app):
     """When the server starts: load the leaderboard, and start the round loop, the broadcaster
     and the saving of the round log.
     The game starts straight away, even if the leaderboard takes a few tries to load."""
-    jobs = [load_ranking(), run_rounds(), broadcast(), save_round_logs()]
+    jobs = [load_ranking(), load_card_holders(), run_rounds(), broadcast(), save_round_logs(), save_cards_forever()]
     tasks = [asyncio.create_task(job) for job in jobs]
     yield
     for task in tasks:
@@ -1229,6 +1634,13 @@ async def lifespan(app):
 app = Starlette(
     routes=[
         Route("/", index),
+        Route("/card.js", card_script),
+        Route("/card.css", card_style),
+        Route("/board.js", board_script),
+        Route("/replay.js", replay_script),
+        Route("/r/{share_id}.png", share_image),  # before /r/{share_id}, which would take "<id>.png" for an id
+        Route("/r/{share_id}/replay", share_replay),
+        Route("/r/{share_id}", share_page),
         Route("/board", board),
         Route("/events", events),
         Route("/buy", buy, methods=["POST"]),

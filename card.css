@@ -1,0 +1,63 @@
+/* The best-round card (card.js). Uses the game's palette: --panel, --text, --muted, --accent,
+   --left and --right. */
+.bm-card { display: grid; gap: 6px; min-width: 0; }
+.bm-card p { margin: 0; }
+.bm-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.bm-profit { display: flex; align-items: baseline; gap: 8px; }
+.bm-number { font-size: 26px; font-weight: bold; line-height: 1.1; }
+.bm-label { font-size: 13px; font-weight: bold; color: var(--muted); }
+.bm-chart { display: block; width: 100%; height: auto; margin: 2px 0; overflow: visible; }
+.bm-grid { stroke: #2c2c2c; stroke-width: 1; }
+.bm-axis { fill: var(--muted); font-size: 9.5px; }
+.bm-line { fill: none; stroke: #c8c8c8; stroke-width: 1.6; stroke-linejoin: round; }
+.bm-line-other { stroke: #5a5a5a; stroke-dasharray: 3 3; }
+.bm-line-after { stroke-dasharray: 1.5 3; stroke-linecap: round; }
+.bm-mark { stroke: var(--panel); stroke-width: 1.4; }
+.bm-left { fill: var(--left); }
+.bm-right { fill: var(--right); }
+.bm-landed { fill: var(--accent); }
+.bm-landed-label { fill: var(--accent); font-size: 10px; font-weight: bold; }
+.bm-glyph { vertical-align: -1px; overflow: visible; }
+.bm-glyph .bm-mark { stroke: none; }
+.bm-summary { font-size: 14px; }
+.bm-stats { font-size: 13px; color: var(--muted); }
+.bm-stats b { color: var(--text); }
+.bm-footer { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 2px; }
+.bm-byline { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 13px; text-transform: lowercase; }
+.bm-share {
+  flex: none; padding: 3px 12px; border: 1px solid var(--accent); border-radius: 6px;
+  font: inherit; font-size: 13px; font-weight: bold; background: none; color: var(--accent); cursor: pointer;
+  touch-action: manipulation;
+}
+.bm-share:hover, .bm-fresh .bm-share { background: var(--accent); color: #111; }
+.bm-share:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+
+/* The share menu: opens upwards from the share button, over the card's own lines, so the card
+   never changes size and nothing outside it is covered. */
+.bm-share-wrap { position: relative; flex: none; }
+.bm-menu {
+  position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 2; min-width: 136px;
+  display: grid; padding: 4px; border-radius: 8px; background: #2a2a2a;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+.bm-menu button {
+  padding: 7px 10px; border: none; border-radius: 6px; background: none; color: var(--text);
+  font: inherit; font-size: 14px; text-align: left; cursor: pointer; white-space: nowrap;
+}
+.bm-menu button:hover, .bm-menu button:focus-visible { background: #3a3a3a; outline: none; }
+.bm-share[aria-expanded="true"] { background: var(--accent); color: #111; }
+
+/* The replay on the share page: the tip of the price line, and each buy's mark popping in. */
+.bm-tip { fill: var(--text); }
+.bm-pop { transform-box: fill-box; transform-origin: center; animation: bm-pop 0.35s ease-out; }
+@keyframes bm-pop { from { transform: scale(2.2); opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) { .bm-pop { animation: none; } }
+
+/* A round that has only just become the best: a yellow edge, a label, and a short glow. */
+.bm-fresh { box-shadow: inset 0 0 0 1px var(--accent); animation: bm-glow 1.6s ease-out; }
+.bm-new {
+  flex: none; padding: 1px 8px; border-radius: 999px; background: var(--accent); color: #111;
+  font-size: 12px; font-weight: bold; white-space: nowrap;
+}
+@keyframes bm-glow { from { box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 6px rgba(255, 204, 51, 0.35); } }
+@media (prefers-reduced-motion: reduce) { .bm-fresh { animation: none; } }

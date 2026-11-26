@@ -12,7 +12,7 @@ https://bouncemarket.minhanhday.com/
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-uv installs the Python dependencies automatically on first run: the Starlette web framework, the uvicorn server with its "standard" extras (uvloop, a faster event loop, and httptools, a faster HTTP parser, both used automatically on Linux and macOS), and the httpx web client. Each is pinned to an exact version, at the top of `app.py` for uv and in `requirements.txt` for Render; the two lists must stay the same. The pinned Starlette needs Python 3.11 or newer.
+uv installs the Python dependencies automatically on first run: the Starlette web framework, the Pillow imaging library (which draws the best-round card for link previews), the uvicorn server with its "standard" extras (uvloop, a faster event loop, and httptools, a faster HTTP parser, both used automatically on Linux and macOS), and the httpx web client. Each is pinned to an exact version, at the top of `app.py` for uv and in `requirements.txt` for Render; the two lists must stay the same. The pinned Starlette needs Python 3.11 or newer.
 
 A [Supabase](https://supabase.com) project, which stores the named players and the round log. To set it up:
 
@@ -61,6 +61,25 @@ A username is 1 to 16 plain letters (A to Z, either case), numbers, `-` or `_`, 
 
 Anyone can start over with 10 points, whatever they have now, named or not. The circling-arrows button on your own leaderboard row does it, asking first only if you have more than 10 points to lose. If you can't afford a share on either side and hold none, a "reset to 10" button also appears under the buy buttons. A reset can't be used while you hold shares in the round being played, or someone could spend everything pushing a price around, start over, and do it again for free. A guest's reset changes nothing in the database and nothing on anyone else's leaderboard, only their own.
 
+## Your best round
+
+Once a round makes you more than 1.00 point, a card for it appears above the leaderboard: the profit, a chart of the price over the round with a mark for each of your buys (circles for Left, triangles for Right), what you bought and at what average price, where the ball landed, and your shares, cost and payout. Profit is everything your winning shares paid out minus everything you paid that round, on both sides. Only a round that beats your best so far replaces the card; a tie doesn't. A new best is marked "new best round" until the next round has been played, inside the card, so it never covers the board or the buy buttons.
+
+The card stays when you reload the page or reset to 10: a reset changes your points, not your record. Guests get one too.
+
+The "share" button opens a small menu:
+
+- **copy text** copies a line and a link, such as:
+
+  ```
+  bouncemarket: bought Left x6 at avg 0.14, landed Left, +5.16 in one round https://bouncemarket.minhanhday.com/r/k3J9xQ2a
+  ```
+
+- **copy image** copies a picture of the card, with "bouncemarket" and the site's address on it, for pasting where a link won't do. It's left out in browsers that can't put a picture on the clipboard.
+- **share…** opens the device's own share sheet, in browsers that have one.
+
+The link opens a public page for anyone, with nothing to sign in to. It plays the round again: the ball falls while the card's price line draws along with it, each of your buys pops onto the chart as you made it, and a line under the board says what's happening ("bought left at 0.13", "trading closed", "landed left · +5.16 points"). Then the "play" button appears. "skip" jumps to the end and "watch again" starts over. With reduced motion turned on in the device's settings, the page shows the finished card without the replay. Posted in a chat app or social feed, the link unfurls with the same picture of the card. Links keep working after you beat that round.
+
 ## How it works
 
 The server runs one game for everyone. It simulates each drop in full the moment the ball is released, but keeps the result to itself.
@@ -82,6 +101,18 @@ If the database can't be reached, the game carries on: everyone can still play, 
 Players without a name live only in the server's memory, and lose their points when it restarts. Once you claim a name, your id, name and points are a row in the Supabase `players` table. The server saves your points there after every round you play in, and loads them back the next time your browser connects.
 
 The database is asked about a player only when it can't already know the answer. The read at startup gives the server the id of every player with a row, and it adds to that list as players claim names. So once that read has worked, a browser id that isn't on the list is a new visitor with nothing saved, and their page starts without the database being asked anything: a big crowd arriving at once costs the database nothing. A player who does have a row is looked up the first time they connect after a restart, for their name, points and lock, and not again until the next restart. Until the startup read has worked (in the first moment after a restart, or while the database is down, when it is tried again every 30 seconds) the server can't tell newcomers from returning players, so it looks up every player as they connect. Claiming a first name also looks the player up once more just before writing the row, in case the row was written moments ago by the previous server, which keeps running for a little while during a deploy; otherwise the new row would overwrite it.
+
+### The best-round card
+
+After each round settles, `new_best_rounds()` in `app.py` works out each buyer's profit from the buys the server itself took, at the frame and price it charged. No route accepts a card, a profit or a trade from a page, so nothing a page sends can make or change one. A round that made more than `CARD_MIN_PROFIT` (1.00) and more than the player's best so far becomes a record, which is sent to that player's open pages as a "card" message (marked fresh) and saved a moment later to the `best_rounds` table by a separate task, like the round log. Pages that connect later are sent the player's card, not fresh.
+
+Each record holds a short random `share_id` (8 characters, the only thing in the link), the player's id and their name at the time, the round's start and settle times, where the ball landed, the player's buys, the left side's price at every frame it changed (cut down to 200 points in a very busy round; the right side's price is always 1 minus it), the cost, payout and profit, and the `start_x`, `gravity`, `bounce` and commit the ball's whole path follows from, for a replay later. Rows are never changed when a better round comes along, so old links keep working, and a player's best is their row with the most profit. The player's id is never sent to a page or shown on a share page.
+
+The card is drawn by `card.js` (styles in `card.css`), on the game page and on the share page `/r/<share_id>` (`share.html`, filled in by `share_page()`). Its preview tags, and the share menu's "copy image", use `/r/<share_id>.png`, a 1200 by 630 picture of the card drawn by `card_image.py` with Pillow, in a thread so the game doesn't wait, and kept in memory once drawn. The address on the picture is `SITE` in `app.py`, not the address a request came in at, as one picture is kept for everyone. A card not saved yet is still found, as share pages look at the unsaved ones first.
+
+The replay (`replay.js`) gets the ball's path from `/r/<share_id>/replay`. The path isn't stored: the server plays the drop again from the record's `start_x`, `gravity` and `bounce` (a few hundredths of a second) and keeps the last 100 in memory. If the physics in `app.py` has changed since, so the drop no longer lasts as long or lands on the same side, that answers 404 and the page shows the card without a replay. The board is drawn by `board.js`, which the game page uses too.
+
+Like the players table, the server reads who has a card once at startup (`load_card_holders()`), so a new visitor's page starts without asking the database, and looks up a returning player's best the first time they connect. If the database is down, cards are still made and shown, and wait in memory (up to 1,000) to be saved.
 
 ## Moderating names
 
@@ -116,7 +147,9 @@ curl -s -X POST "$SITE/admin/rename" -H "Authorization: Bearer $ADMIN_KEY" \
   -H "Content-Type: application/json" -d '{"name": "TheBadName", "to": "renamed1"}'
 ```
 
-It answers `{"renamed": "TheBadName", "to": "player-4821", "points": 12.5, "name_locked": true}`. The new name is written to the database first; only if that works does the server change the leaderboard for everyone, and the player's own pages, at once. If the database write fails, nothing changes and the answer says why.
+It answers `{"renamed": "TheBadName", "to": "player-4821", "points": 12.5, "name_locked": true, "cards": "renamed"}`. The new name is written to the database first; only if that works does the server change the leaderboard for everyone, and the player's own pages, at once. If the database write fails, nothing changes and the answer says why.
+
+A rename also puts the new name on all the player's best-round cards, old ones included, so the bad name doesn't live on in share pages. `"cards"` says whether that worked; if it didn't, the rename itself still has, and renaming again retries it. Link previews that chat apps have already fetched may keep the old picture for up to a day.
 
 Lift a lock, so the player can choose a name again:
 

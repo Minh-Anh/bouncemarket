@@ -54,6 +54,34 @@ create table if not exists rounds (
 alter table rounds enable row level security;
 
 
+-- The best-round card. See "The best-round card" in the README.
+
+-- One row for every round that became a player's best when it was played. A row is never
+-- changed or removed when a better round comes along, so old share links keep working: a
+-- player's best round now is simply their row with the most profit.
+create table if not exists best_rounds (
+  share_id text primary key,  -- the short random id in the link, /r/<share_id>
+  player text not null,  -- the same id as players.id; treat it like a password, never show it
+  username text,  -- the player's name when the round was played, or null for a guest
+  round_started_at timestamptz not null,  -- which round: the same as rounds.started_at
+  settled_at timestamptz not null,  -- when the ball landed
+  outcome text not null check (outcome in ('left', 'right')),  -- where the ball landed
+  frames integer not null,  -- how many frames (60 a second) the ball took to land
+  close_frame integer not null,  -- the frame trading closed at
+  trades jsonb not null,  -- the player's buys, as [[frame, side, price, shares], ...]
+  prices jsonb not null,  -- the left side's price over the round, as [[frame, price], ...]
+  cost numeric not null,  -- everything the player paid this round, both sides
+  payout numeric not null,  -- 1 for each share on the side the ball landed on
+  profit numeric not null,  -- payout minus cost
+  trajectory jsonb not null  -- what the ball's path follows from: {"start_x", "gravity", "bounce", "commit_id"}
+);
+
+-- Makes finding a player's best round fast.
+create index if not exists best_rounds_player on best_rounds (player, profit desc);
+
+alter table best_rounds enable row level security;
+
+
 -- Ask Supabase's web API to read the tables again, so it knows about any column just added
 -- straight away. (It usually notices by itself; this makes sure.)
 notify pgrst, 'reload schema';

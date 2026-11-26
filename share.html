@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- The public page for one best-round card, /r/<share_id>. The server fills in each {{...}}
+       (see share_page() in app.py): the words and picture for link previews, and the card itself. -->
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{title}}</title>
+  <meta name="description" content="{{description}}">
+  <meta name="theme-color" content="#111111">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111'/><circle cx='16' cy='16' r='7' fill='%23fc3'/></svg>">
+  <!-- What chat and social apps show when someone pastes the link: a title, a line, and a picture of the card. -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="bouncemarket">
+  <meta property="og:title" content="{{title}}">
+  <meta property="og:description" content="{{description}}">
+  <meta property="og:url" content="{{url}}">
+  {{image_tags}}
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{title}}">
+  <meta name="twitter:description" content="{{description}}">
+  <link rel="stylesheet" href="/card.css">
+  <style>
+    /* The game's palette (see index.html). */
+    :root {
+      --background: #111;
+      --panel: #1c1c1c;
+      --text: #eee;
+      --muted: #999;
+      --accent: #fc3;
+      --left: #3987e5;
+      --right: #d95926;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body {
+      margin: 0; background: var(--background); color: var(--text);
+      font: 15px/1.4 system-ui, sans-serif;
+      font-variant-numeric: tabular-nums;
+    }
+    p { margin: 0; }
+    .panel { background: var(--panel); border-radius: 12px; padding: 12px 14px; }
+    main { max-width: 432px; margin: 0 auto; padding: 24px 16px; display: grid; gap: 16px; justify-items: center; text-align: center; }
+    #card { width: 100%; text-align: left; }
+    .title { font-size: 18px; font-weight: bold; color: var(--text); text-decoration: none; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .play {
+      padding: 10px 32px; border-radius: 8px; background: var(--accent); color: #111;
+      font-weight: bold; text-decoration: none;
+    }
+    .play:focus-visible, .text-button:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+    .play.arrive { animation: arrive 0.4s ease-out; }
+    @keyframes arrive { from { transform: translateY(6px); opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) { .play.arrive { animation: none; } }
+
+    /* The replay (see replay.js): the board, kept short enough on a phone that the card's
+       chart below it is in view too, and the game's status line under it. */
+    #replay { width: 100%; display: grid; gap: 8px; }
+    #board { padding: 12px; }
+    canvas { display: block; margin: 0 auto; max-width: 100%; max-height: 42dvh; }
+    #replay-line { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    #replay-status { font-weight: bold; color: var(--accent); font-size: 16px; text-align: left; }
+    .text-button {
+      padding: 0; border: none; background: none; font: inherit; font-size: 13px;
+      color: var(--muted); text-decoration: underline; cursor: pointer;
+    }
+    .text-button:hover { color: var(--text); }
+    #actions { display: flex; align-items: center; gap: 16px; min-height: 40px; }
+  </style>
+</head>
+<body>
+  <main>
+    <a class="title" href="/">bouncemarket</a>
+    <div id="replay" hidden>
+      <div class="panel" id="board"><canvas id="canvas" aria-label="the round played again: the ball falling and landing"></canvas></div>
+      <div id="replay-line">
+        <span id="replay-status" aria-live="off"></span>
+        <button type="button" class="text-button" id="skip" hidden>skip</button>
+      </div>
+    </div>
+    <div id="card"></div>
+    <p class="muted" id="message">{{message}}</p>
+    <noscript><p>{{description}}</p></noscript>
+    <p class="muted">a ball will fall. trade on where it lands.</p>
+    <div id="actions">
+      <button type="button" class="text-button" id="again" hidden>watch again</button>
+      <a class="play" id="play" href="/">play</a>
+    </div>
+  </main>
+  <script type="application/json" id="record">{{card}}</script>
+  <script src="/board.js"></script>
+  <script src="/card.js"></script>
+  <script src="/replay.js"></script>
+  <script>
+    // The card, read-only: no share button, as whoever opens the link is just looking. Then the
+    // round is played again above it (see replay.js), and the play button appears at the end.
+    const record = JSON.parse(document.getElementById("record").textContent);
+    document.getElementById("message").hidden = !document.getElementById("message").textContent;
+    if (record) {
+      const card = bestRoundCard.makeCard(record, { share: false });
+      document.getElementById("card").append(card);
+      replayRound({
+        record,
+        card,
+        canvas: document.getElementById("canvas"),
+        status: document.getElementById("replay-status"),
+        skip: document.getElementById("skip"),
+        again: document.getElementById("again"),
+        play: document.getElementById("play"),
+      });
+    }
+  </script>
+</body>
+</html>

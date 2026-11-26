@@ -18,6 +18,8 @@
   <meta property="og:description" content="a ball will fall. trade on where it lands.">
   <meta property="og:url" content="https://bouncemarket.minhanhday.com/">
   <meta name="twitter:card" content="summary">
+  <!-- The best-round card's own styles, shared with the share page (see card.js). -->
+  <link rel="stylesheet" href="/card.css">
   <style>
     /* The whole palette: yellow as the accent, blue for the left side and orange for the right
        (the buy buttons and the odds bar), and three greys. */
@@ -240,6 +242,8 @@
         <div id="odds-labels"><span id="odds-left-label"></span><span id="odds-right-label"></span></div>
         <div id="odds-bar"><div id="odds-left"></div><div id="odds-right"></div></div>
       </div>
+      <!-- Our best single round, once we've had one that made more than 1.00 (see showCard()). -->
+      <div id="best-round" hidden></div>
       <div class="panel">
         <div class="panel-head">
           <h2>leaderboard</h2>
@@ -299,14 +303,13 @@
     </div>
   </dialog>
 
+  <script src="/board.js"></script>
+  <script src="/card.js"></script>
   <script>
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
     const FPS = 60;  // the ball moves one frame every 1/60 second
     const MIN_ONLINE_SHOWN = 5;  // the header says how many are online only when at least this many are
-    const BALL_DRAW_SCALE = 1.5;  // how much bigger the ball is drawn than the physics ball; only the picture changes
-    const BALL_GLOW = 20;  // how far the ball's soft yellow glow spreads, in canvas pixels; 0 for none
-    const BALL_GLOW_LAYERS = 2;  // how many times the glow is stacked; each layer makes it brighter
     const FADE_RATE = 4;  // how sharp the landing highlight's fade is: higher makes the start and end quicker and the middle flatter
     // The color behind the board: the page's own background, read from the palette at the top of the file.
     const FIELD_COLOR = getComputedStyle(document.documentElement).getPropertyValue("--background").trim();
@@ -320,6 +323,10 @@
     let dropsAt = null;  // on our clock, the moment the next ball will drop (only between drops)
     let updateAt = null;  // on our clock, the moment of the system update the owner announced, if any
     let noticeShown = null;  // what the notice banner says now, so it's only rebuilt when that changes
+    let card = null;  // our best-round card, from the latest "card" message, or null if we have none
+    // Whether the card is a new best, shown with a yellow edge and a label: null if not, else
+    // "waiting" for the next ball to drop, then "dropping" until it lands, when it stops being new.
+    let cardFresh = null;
 
     // A random id, remembered by this browser, that tells the server which player we are.
     let playerId = localStorage.getItem("playerId");
@@ -328,68 +335,20 @@
       localStorage.setItem("playerId", playerId);
     }
 
-    function circle(x, y, r, color) {
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, 2 * Math.PI);
-      ctx.fill();
-    }
-
-    function polygon(points, color) {
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      for (const [x, y] of points) ctx.lineTo(x, y);
-      ctx.fill();
-    }
-
-    // Draw the walls, pins and divider, plus the ball if a position is given.
+    // Draw the board (see board.js), plus the ball if a position is given.
     // Between drops there is no ball. Instead the bucket it landed in starts out yellow,
     // the ball's color, and fades away by the time the next ball drops.
     function draw(ball) {
-      const w = board.width, h = board.height, mid = board.width / 2, top = board.last_row_y;
-      // The walls lean in, so the space the ball falls through is a trapezoid. inset(y) is how far in a wall is at height y.
-      const inset = (y) => board.wall_slant * y / h;
-      // The board sits on a dark rectangle, like a window cut in the panel. The rectangle is what
-      // makes the board look flat: with a dark trapezoid behind the pins instead, the eye takes
-      // the whole board for a rectangle tipping away, not for a flat board with leaning walls.
-      ctx.fillStyle = FIELD_COLOR;
-      ctx.fillRect(0, 0, w, h);
+      let highlight = 0;
       if (!ball && game && game.last_bucket && dropsAt !== null) {
         // How far through the countdown we are, from 0 at landing to 1 at the next drop.
         const progress = Math.min(1, Math.max(0, 1 - (dropsAt - performance.now()) / 1000 / board.countdown_seconds));
         // A reverse S-curve: fades fast at first, lingers around half strength, then fades fast
         // again at the end. sinh is steep at both ends and flat in the middle, and dividing by
         // sinh(FADE_RATE) scales it so the highlight starts at exactly 1 and ends at exactly 0.
-        ctx.globalAlpha = 0.5 - 0.5 * Math.sinh(FADE_RATE * (2 * progress - 1)) / Math.sinh(FADE_RATE);
-        // The bucket: from the last row of pins down to the floor, between the wall and the divider.
-        const bucket = game.last_bucket === "left"
-          ? [[inset(top), top], [inset(h), h], [mid, h], [mid, top]]
-          : [[w - inset(top), top], [w - inset(h), h], [mid, h], [mid, top]];
-        polygon(bucket, "#fc3");
-        ctx.globalAlpha = 1;
+        highlight = 0.5 - 0.5 * Math.sinh(FADE_RATE * (2 * progress - 1)) / Math.sinh(FADE_RATE);
       }
-      // The ball is drawn bigger than the one in the physics, so it's easy to see on a phone. It goes
-      // under the walls and pins, so where it overlaps them it looks tucked behind, not sunk into them.
-      if (ball) {
-        // A soft yellow glow makes the ball easy to spot without drawing it any bigger.
-        ctx.shadowColor = "rgba(255, 204, 51, 0.8)";
-        ctx.shadowBlur = BALL_GLOW;
-        for (let layer = 0; layer < BALL_GLOW_LAYERS; layer++) {
-          circle(ball[0], ball[1], board.ball_r * BALL_DRAW_SCALE, "#fc3");
-        }
-        ctx.shadowBlur = 0;  // nothing else glows
-      }
-      ctx.strokeStyle = "#888";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(1, 0);  // the walls and floor, as one open-topped trapezoid
-      ctx.lineTo(inset(h) + 1, h - 1);
-      ctx.lineTo(w - inset(h) - 1, h - 1);
-      ctx.lineTo(w - 1, 0);
-      ctx.moveTo(mid, top);  // divider between the buckets
-      ctx.lineTo(mid, h);
-      ctx.stroke();
-      for (const [x, y] of board.pins) circle(x, y, board.pin_r, "#888");
+      drawBoard(ctx, board, { ball, bucket: game && game.last_bucket, highlight, field: FIELD_COLOR });
     }
 
     // A number of points with its sign, e.g. +1.58 or −1.42 (a real minus sign, as wide as the
@@ -672,12 +631,36 @@
       list.replaceChildren(...rows);
     }
 
+    // Our best single round, above the leaderboard, drawn by card.js. The server only makes a
+    // card for a round that made more than 1.00, so with none there's nothing here at all. A new
+    // best is marked as new, in the card itself, never over the board, so the buy buttons stay
+    // usable; it stays marked until the next round has been played. Redrawn only when the card or
+    // that mark changes, so a "copied" on the share button isn't wiped by the next message.
+    function showCard() {
+      const slot = document.getElementById("best-round");
+      slot.hidden = !(card && card.profit > 1);
+      if (slot.hidden) return;
+      slot.replaceChildren(bestRoundCard.makeCard(card, { fresh: cardFresh !== null }));
+    }
+
+    // Counts the new best down to ordinary: the card arrives as the ball lands, then the next
+    // ball drops, and once that one lands too the card is no longer new.
+    function ageCard(dropping) {
+      if (cardFresh === "waiting" && dropping) {
+        cardFresh = "dropping";
+      } else if (cardFresh === "dropping" && !dropping) {
+        cardFresh = null;
+        showCard();
+      }
+    }
+
     // The public "game" message arrives up to 10 times a second: twice a second early in a drop,
     // 10 times a second near the end of one, and once a second between drops. While the ball is
     // falling, each one carries the next ball positions, ahead of time. We queue them and play
     // them back on our own clock, so uneven arrival times don't make the ball stutter.
     function receiveGame(update) {
       game = update;
+      ageCard(game.dropping);
       // The announced update, if any. Its time is kept steady against network jitter, and only
       // moved if the owner announces a new one (a jump of more than a couple of seconds).
       if (game.update_in === undefined) {
@@ -733,6 +716,13 @@
       stream.addEventListener("me", (event) => { me = JSON.parse(event.data); clearResetErrors(); render(); showLeaderboard(); });
       stream.addEventListener("leaderboard", (event) => { leaderboard = JSON.parse(event.data); showLeaderboard(); });
       stream.addEventListener("game", (event) => receiveGame(JSON.parse(event.data)));
+      // Our best-round card: when we connect, if we have one, and whenever a round becomes our new best.
+      stream.addEventListener("card", (event) => {
+        const message = JSON.parse(event.data);
+        card = message.card;
+        cardFresh = message.fresh ? "waiting" : null;
+        showCard();
+      });
       requestAnimationFrame(play);
     }
     init();
