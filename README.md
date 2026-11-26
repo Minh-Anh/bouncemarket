@@ -67,7 +67,7 @@ The server runs one game for everyone. It simulates each drop in full the moment
 
 Every open page holds one stream from the server (as [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)) carrying two kinds of message:
 
-- A public "game" message, identical for every player: the countdown, the price of each side, and while the ball is falling, its next positions. It is sent only as often as needed, because at scale these messages are most of the server's work and bandwidth: twice a second early in a drop, 10 times a second for the last 1.5 seconds before betting closes and until the ball lands, once a second between drops, and straight away when a drop starts or the ball lands.
+- A public "game" message, identical for every player: the countdown, the price of each side, the seconds until an announced update if there is one (see [Announcing an update](#announcing-an-update)), and while the ball is falling, its next positions. It is sent only as often as needed, because at scale these messages are most of the server's work and bandwidth: twice a second early in a drop, 10 times a second for the last 1.5 seconds before betting closes and until the ball lands, once a second between drops, and straight away when a drop starts or the ball lands.
 - A private "me" message with your name, points and shares, and `name_locked`, which is true if the owner has locked your name, sent when you connect, after each round, and when the owner changes your name. Buying a share, setting a name and resetting return the same information.
 - A "leaderboard" message with the top 10 named players, sent when you connect and after each round. If you're ranked below the top 10, it also has the two players either side of you, which the page shows under a "…" with your row in yellow. The server reads every named player's id and points from the database once when it starts, then keeps the ranking up to date in memory: it is the only thing that changes anyone's points, so it never needs to read them again.
 
@@ -130,6 +130,19 @@ The errors are `400` for a bad request or a `"to"` that breaks the username rule
 The `name_locked` column must exist before these work: run `schema.sql` again (it only adds what is missing). If the new code runs before the column exists, the game itself is unaffected, as the server reads each player's row without naming the column and treats a missing one as "not locked". Only renaming and unlocking fail, with an answer saying to run `schema.sql`.
 
 Avoid moderating during a deploy: for a minute or so the previous server is still running, and it may save a round's points under the old name, undoing the change. If that happens, rename again once the deploy has finished.
+
+## Announcing an update
+
+A deploy restarts the server, and guests (players without a username) lose their points. To warn them first, put up a banner on every open page that counts down to the update. With `ADMIN_KEY` and `SITE` set as above, for an update in 15 minutes:
+
+```
+curl -s -X POST "$SITE/admin/notice" -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" -d '{"minutes": 15}'
+```
+
+Every page then shows "System update in 15 minutes, all non-named player scores may be wiped. If you would like to save your points, choose a username before the update.", counting down a minute at a time, with "choose a username" opening the username dialog for guests. When the time is up it says the update is starting now. It answers `{"notice": "published", "minutes": 15, "update_at": "..."}`. `minutes` can be any number from 0 to 1440, fractions included, and sending a new one restarts the countdown. Send `{"minutes": 0}` to take the banner down.
+
+The banner lives only in the server's memory, so the deploy it announces takes it down. Pages that connect while it is up see it within a second.
 
 ## The round log
 

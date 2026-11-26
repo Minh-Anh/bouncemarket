@@ -127,6 +127,7 @@ game = {
     "positions": {},  # each name's index in "ranking", so a player can be found quickly
     "minus_points": [],  # minus each player's points, in "ranking" order, so it ascends for bisect
     "ranking_loaded": False,  # whether load_ranking() has read the whole players table yet
+    "update_at": None,  # when the owner has announced a system update for (see admin_notice()), or None
 }
 
 # One entry per player who has opened the page since the server started, keyed by the
@@ -805,6 +806,9 @@ async def broadcast():
             "online": len(streams),
             "last_bucket": game["last_bucket"],
         }
+        if game["update_at"] is not None:
+            # Seconds until the announced update, which the page counts down on its own clock.
+            message["update_in"] = max(0, round(game["update_at"] - time.time()))
         if dropping:
             # The positions the pages don't have yet, and the frame number of the first of them.
             # Never past close_frame + BUFFER_FRAMES (the last row) while betting is open, however early it is.
@@ -1180,6 +1184,36 @@ async def admin_unlock(request):
     return JSONResponse({"unlocked": rows[0]["name"], "name_locked": False})
 
 
+MAX_NOTICE_MINUTES = 24 * 60  # the furthest ahead an update can be announced
+
+
+async def admin_notice(request):
+    """Announce a system update to everyone. Send {"minutes": N}: every page shows a banner
+    counting down N minutes, telling guests their points may be lost and to choose a username
+    to keep them. Send {"minutes": 0} to take the banner down. Sending a new number restarts it.
+
+    It lives in memory only, so a restart (which the update itself usually is) takes it down.
+    Once the time is up the banner says the update is starting now, until it is taken down.
+    """
+    refusal = admin_refusal(request)
+    if refusal:
+        return refusal
+    data = await read_json(request)
+    minutes = data.get("minutes")
+    # type() rather than isinstance(), because True and False count as numbers to isinstance().
+    if type(minutes) not in (int, float) or not math.isfinite(minutes) or not 0 <= minutes <= MAX_NOTICE_MINUTES:
+        return JSONResponse(
+            {"error": f'"minutes" must be a number from 0 to {MAX_NOTICE_MINUTES}. 0 takes the notice down.'},
+            status_code=400,
+        )
+    if minutes == 0:
+        game["update_at"] = None
+        return JSONResponse({"notice": None})
+    game["update_at"] = time.time() + minutes * 60
+    update_at = datetime.datetime.fromtimestamp(game["update_at"], datetime.timezone.utc).isoformat(timespec="seconds")
+    return JSONResponse({"notice": "published", "minutes": minutes, "update_at": update_at})
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
     """When the server starts: load the leaderboard, and start the round loop, the broadcaster
@@ -1203,6 +1237,7 @@ app = Starlette(
         Route("/admin/names", admin_names),
         Route("/admin/rename", admin_rename, methods=["POST"]),
         Route("/admin/unlock", admin_unlock, methods=["POST"]),
+        Route("/admin/notice", admin_notice, methods=["POST"]),
     ],
     lifespan=lifespan,
 )

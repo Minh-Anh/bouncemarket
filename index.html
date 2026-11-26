@@ -58,8 +58,8 @@
     /* The notes never wrap onto a second line, which would make the page jump every time the
        countdown appeared. If they ever don't fit, the end is cut off with "…" instead. */
     #header-notes { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    /* A dot between the countdown and how many are online, only while there is a countdown. */
-    #countdown:not(:empty)::after { content: "\00a0·\00a0"; }
+    /* A dot between the countdown and how many are online, only while both are showing. */
+    #countdown:not(:empty) + #online:not(:empty)::before { content: "\00a0·\00a0"; }
     #header-side { flex: 1 1 260px; text-align: right; }  /* as wide as the sidebar, which it sits above */
     .credit { color: var(--muted); font-size: 13px; text-decoration: none; }
     .credit:hover { color: var(--text); text-decoration: underline; }
@@ -174,6 +174,14 @@
     #reset-confirm, #claim-confirm { background: var(--accent); color: #111; font-weight: bold; }
 
     #leaderboard .gap { color: var(--muted); }  /* the "…" between the top 10 and the rows around you */
+
+    /* The banner the owner can put up before a system update (see showNotice()), above the game.
+       Unlike the rest of the page it isn't lowercase: it's the site speaking, not the game. */
+    #notice { margin-bottom: 14px; border: 1px solid var(--accent); font-size: 14px; }
+    #notice button {
+      padding: 0; border: none; background: none; font: inherit; font-weight: bold;
+      color: var(--accent); text-decoration: underline; cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -185,6 +193,8 @@
     </div>
     <div id="header-side"><a class="credit" href="https://minhanhday.com/code" target="_blank" rel="noopener">created by minh-anh day</a></div>
   </header>
+
+  <p class="panel" id="notice" role="status" hidden></p>
 
   <main>
     <section id="game">
@@ -293,6 +303,7 @@
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
     const FPS = 60;  // the ball moves one frame every 1/60 second
+    const MIN_ONLINE_SHOWN = 5;  // the header says how many are online only when at least this many are
     const BALL_DRAW_SCALE = 1.5;  // how much bigger the ball is drawn than the physics ball; only the picture changes
     const BALL_GLOW = 20;  // how far the ball's soft yellow glow spreads, in canvas pixels; 0 for none
     const BALL_GLOW_LAYERS = 2;  // how many times the glow is stacked; each layer makes it brighter
@@ -307,6 +318,8 @@
     let dropStart = null;  // on our clock, the moment the ball dropped
     let shownFrame = null;  // the frame of the ball position on screen right now (null between drops)
     let dropsAt = null;  // on our clock, the moment the next ball will drop (only between drops)
+    let updateAt = null;  // on our clock, the moment of the system update the owner announced, if any
+    let noticeShown = null;  // what the notice banner says now, so it's only rebuilt when that changes
 
     // A random id, remembered by this browser, that tells the server which player we are.
     let playerId = localStorage.getItem("playerId");
@@ -391,7 +404,9 @@
     // Show everything except the ball, from the latest public and private messages.
     function render() {
       if (!game || !me) return;
-      document.getElementById("online").textContent = `${game.online} online`;  // everyone with the page open, us included
+      // Everyone with the page open, us included. Shown only once there's a crowd: "1 online" or
+      // "2 online" makes the game look empty, which is worse than saying nothing.
+      document.getElementById("online").textContent = game.online >= MIN_ONLINE_SHOWN ? `${game.online} online` : "";
 
       // A share can be bought while betting is open, if we can afford its price.
       // Once we hold shares this round, each card also shows what we'd net if the ball lands on
@@ -435,6 +450,37 @@
       document.getElementById("status").textContent = status;
       document.getElementById("balance").textContent = me.points.toFixed(2);  // updates as soon as we buy
       showCountdown();
+      showNotice();
+    }
+
+    // The banner announcing a system update, counting down in whole minutes on our own clock.
+    // For a guest, "choose a username" is a button that opens the username dialog.
+    function showNotice() {
+      const notice = document.getElementById("notice");
+      if (updateAt === null) {
+        notice.hidden = true;
+        noticeShown = null;
+        return;
+      }
+      const minutes = Math.ceil((updateAt - performance.now()) / 60000);
+      const when = minutes > 0 ? `in ${minutes} minute${minutes === 1 ? "" : "s"}` : "starting now";
+      const guest = me.name === null;
+      // Rebuilt only when the words change, so a guest's click on the button is never lost to a redraw.
+      const key = `${when}|${guest}`;
+      if (key === noticeShown) return;
+      noticeShown = key;
+      const choose = document.createElement(guest ? "button" : "span");
+      choose.textContent = "choose a username";
+      if (guest) {
+        choose.type = "button";
+        choose.onclick = openNameDialog;
+      }
+      notice.replaceChildren(
+        `System update ${when}, all non-named player scores may be wiped. If you would like to save your points, `,
+        choose,
+        " before the update.",
+      );
+      notice.hidden = false;
     }
 
     // Between drops the server only sends a message once a second, so the countdown runs on
@@ -632,6 +678,14 @@
     // them back on our own clock, so uneven arrival times don't make the ball stutter.
     function receiveGame(update) {
       game = update;
+      // The announced update, if any. Its time is kept steady against network jitter, and only
+      // moved if the owner announces a new one (a jump of more than a couple of seconds).
+      if (game.update_in === undefined) {
+        updateAt = null;
+      } else {
+        const at = performance.now() + game.update_in * 1000;
+        if (updateAt === null || Math.abs(at - updateAt) > 2000) updateAt = at;
+      }
       if (!game.dropping) {
         queue = [];
         dropStart = null;
