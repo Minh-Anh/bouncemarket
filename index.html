@@ -33,8 +33,10 @@
       --right: #d95926;
     }
     * { box-sizing: border-box; }
-    /* Tapping quickly anywhere on the page doesn't zoom in. Pinching to zoom still works. */
-    html { touch-action: manipulation; }
+    /* Tapping quickly anywhere on the page doesn't zoom in. Pinching to zoom still works.
+       It's set on every element, not just on html: iOS Safari doesn't always carry it down from
+       the page to what's tapped, and a dialog's backdrop doesn't inherit from the page at all. */
+    *, *::before, *::after, ::backdrop { touch-action: manipulation; }
     [hidden] { display: none !important; }  /* without this, a display rule below would un-hide a hidden element */
     body {
       margin: 0; background: var(--background); color: var(--text);
@@ -106,7 +108,11 @@
       font: inherit; font-weight: bold; color: #111; cursor: pointer;  /* dark text reads better than white on both colors */
       touch-action: manipulation;  /* stops a quick double tap from zooming the page */
     }
-    .side button:active { transform: scale(0.97); }
+    .side button:active, .side button.pressed { transform: scale(0.97); }
+    /* The key that buys on each side, shown after the button's text. Hidden on touch screens,
+       which have no keyboard to press it on. */
+    .side button kbd { margin-left: 6px; font: inherit; opacity: 0.6; }
+    @media (hover: none) { .side button kbd { display: none; } }
     #left-side button { background: var(--left); }
     #right-side button { background: var(--right); }
     .side button:disabled { opacity: 0.3; cursor: default; }
@@ -134,7 +140,8 @@
     /* Panel headings, with a note (that trading has closed, on the market odds) pushed to the right. */
     .panel-head { display: flex; justify-content: space-between; align-items: baseline; }
 
-    #name { width: 100%; font: inherit; padding: 6px 10px; border-radius: 8px; border: none; margin-bottom: 8px; }
+    /* 16px, not the page's 15px: iOS zooms in on any text box smaller than that when it's tapped. */
+    #name { width: 100%; font: inherit; font-size: 16px; padding: 6px 10px; border-radius: 8px; border: none; margin-bottom: 8px; }
 
     /* The "set username" button on a guest's own leaderboard row, after "you". */
     #leaderboard .claim-button {
@@ -213,14 +220,14 @@
           <p class="muted">price per share</p>
           <p class="price" id="price-left"></p>
           <p class="muted holding">you hold <span id="shares-left">0</span><span class="net" id="net-left"></span></p>
-          <button data-side="left">buy 1 share</button>
+          <button data-side="left">buy 1 share<kbd>←</kbd></button>
         </div>
         <div class="side panel" id="right-side">
           <p class="label">Right</p>
           <p class="muted">price per share</p>
           <p class="price" id="price-right"></p>
           <p class="muted holding">you hold <span id="shares-right">0</span><span class="net" id="net-right"></span></p>
-          <button data-side="right">buy 1 share</button>
+          <button data-side="right">buy 1 share<kbd>→</kbd></button>
         </div>
       </div>
 
@@ -451,16 +458,31 @@
       document.getElementById("countdown").textContent = game.dropping ? "" : `next drop in ${seconds}s`;
     }
 
+    // Everything we ask the server to do goes through here. During an update the game moves to
+    // a new server, and for a moment a request can still reach the old one, which answers 503
+    // with "moved". Then we wait a little and ask again, and the request reaches the new one.
+    const MOVED_RETRIES = 4;
+    const MOVED_WAIT_MS = 400;
+    async function post(path, body) {
+      for (let attempt = 0; ; attempt++) {
+        const response = await fetch(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (response.status !== 503 || attempt >= MOVED_RETRIES) return response;
+        const result = await response.clone().json().catch(() => ({}));
+        if (!result.moved) return response;
+        await new Promise((resolve) => setTimeout(resolve, MOVED_WAIT_MS));
+      }
+    }
+
     // Each buy button asks the server to buy one share on its side at the current price.
     // The server answers with our new points and shares. We also say which frame we were showing,
     // which the server only keeps for its log: it tells an analysis what the player was looking at.
     for (const buyButton of document.querySelectorAll(".side button")) {
       buyButton.onclick = async () => {
-        const response = await fetch("/buy", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ player: playerId, side: buyButton.dataset.side, frame: shownFrame }),
-        });
+        const response = await post("/buy", { player: playerId, side: buyButton.dataset.side, frame: shownFrame });
         if (response.ok) {
           me = await response.json();
           render();
@@ -468,16 +490,40 @@
       };
     }
 
+    // The keyboard buys too: the left arrow on the left, the right arrow on the right. Each press
+    // clicks that side's button, so a disabled button (betting closed, can't afford it) does nothing.
+    // Holding a key down buys once, not over and over. Keys are left alone while a dialog is open
+    // or we're typing, so the arrows still move the cursor in the username box.
+    const BUY_KEYS = { ArrowLeft: "left", ArrowRight: "right" };
+    function buyButtonFor(event) {
+      const side = BUY_KEYS[event.key];
+      if (!side || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return null;
+      if (document.querySelector("dialog[open]")) return null;
+      if (event.target.closest("input, textarea, select, [contenteditable]")) return null;
+      return document.querySelector(`.side button[data-side="${side}"]`);
+    }
+    document.addEventListener("keydown", (event) => {
+      const button = buyButtonFor(event);
+      if (!button) return;
+      event.preventDefault();  // no page scrolling sideways
+      if (event.repeat) return;
+      button.classList.add("pressed");
+      button.click();
+    });
+    document.addEventListener("keyup", (event) => {
+      const side = BUY_KEYS[event.key];
+      if (side) document.querySelector(`.side button[data-side="${side}"]`).classList.remove("pressed");
+    });
+    window.addEventListener("blur", () => {
+      for (const button of document.querySelectorAll(".side button.pressed")) button.classList.remove("pressed");
+    });
+
     // Resetting: start over with 10 points. The server refuses while we hold shares in the round
     // being played, and its reason is shown in errorText, next to whatever was pressed.
     // Returns whether it worked.
     async function resetPoints(errorText) {
       errorText.textContent = "";
-      const response = await fetch("/reset", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ player: playerId }),
-      });
+      const response = await post("/reset", { player: playerId });
       const result = await response.json();
       if (!response.ok) {
         errorText.textContent = result.error;
@@ -554,11 +600,7 @@
 
     document.getElementById("claim").onsubmit = async (event) => {
       event.preventDefault();  // stop the browser reloading the page, its default for forms
-      const response = await fetch("/name", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ player: playerId, name: document.getElementById("name").value }),
-      });
+      const response = await post("/name", { player: playerId, name: document.getElementById("name").value });
       const result = await response.json();
       if (response.ok) {
         me = result;
@@ -649,11 +691,7 @@
     // next round over 1.00 makes a new card; links they've shared keep working. The server also
     // tells our other open pages. Returns whether it worked, for the card to say so if it didn't.
     async function deleteCard() {
-      const response = await fetch("/card/clear", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ player: playerId }),
-      }).catch(() => null);
+      const response = await post("/card/clear", { player: playerId }).catch(() => null);
       if (!response || !response.ok) return false;
       card = null;
       cardFresh = null;
@@ -732,7 +770,9 @@
       draw(null);
       // The server sends a stream of messages for as long as the page is open: a private
       // "me" message with our name, points and shares, the public "game" message, and the leaderboard.
-      // If the connection drops, the browser reconnects by itself.
+      // If the connection drops, the browser reconnects by itself. That is also how we follow
+      // the game to a new server during an update: the old server ends the stream, the browser
+      // connects again, and the new server carries on from the same frame.
       const stream = new EventSource("/events?player=" + playerId);
       // A "me" message comes after each round, which makes any "reset once this round is over" out of date.
       stream.addEventListener("me", (event) => { me = JSON.parse(event.data); clearResetErrors(); render(); showLeaderboard(); });

@@ -74,6 +74,9 @@ COMMIT = os.environ.get("RENDER_GIT_COMMIT", "local")  # which version of this c
 UNSAVED_ROUNDS_KEPT = 20  # if the database can't be reached, this many rounds wait in memory, and older ones are dropped
 KEYS_PER_REQUEST = 500  # the most players whose keys (see player_keys) are asked for in one request to the database
 NOT_SEEN = 0xFFFF  # stands in for the frame a page was showing when it didn't say
+TIMING_FORMAT = 1  # saved inside each round's timing; change it whenever pack_timing() changes what it writes
+NO_TIME = 0xFFFFFFFF  # stands in for a time in the timing log that there isn't one of
+NO_BROADCAST = 0xFFFF  # stands in for a broadcast in the timing log that there isn't one of
 
 # The best-round card: each player's best single round, which they can share. See "The
 # best-round card" below, card.js, which draws it, and card_image.py, which draws its picture.
@@ -85,6 +88,24 @@ IMAGES_KEPT = 100  # how many link-preview pictures are kept in memory once draw
 PATHS_KEPT = 100  # how many replays' ball paths are kept in memory once worked out
 SITE = "bouncemarket.minhanhday.com"  # where to play, written on the card's picture
 SHARE_ID = re.compile(r"[A-Za-z0-9_-]{8}")  # what secrets.token_urlsafe(6) makes: 6 random bytes as 8 characters
+
+# The handover: during an update the old server hands the whole game to the new one, so nobody
+# playing notices. See "The handover" below, and "Updating without stopping the game" in the README.
+INSTANCE = secrets.token_urlsafe(8)  # this running server's own name, made up afresh every time it starts
+# The address the site is reached at from outside, which is how the old and the new server find
+# each other. Render sets RENDER_EXTERNAL_URL; without either, there are no handovers.
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+HANDOVER_FORMAT = 1  # change it whenever handover_snapshot() changes what it sends in a way take_over() can't read
+HELLO_SECONDS = 5  # how often a new server says hello again while it waits for the game
+PROBE_SECONDS = 0.5  # how often the old server asks the site's address who answers there, once a new server has said hello
+WATCH_SECONDS = 20 * 60  # how long it keeps asking; Render gives up on a deploy after 15 minutes
+HOLD_SECONDS = 5  # how long a request waits for a handover to finish before it is answered anyway
+HAND_OVER_SECONDS = 8  # how long the old server keeps trying to deliver the game before carrying on with it itself
+HAND_OVER_TRIES = 3  # how many times it tries that in one update
+LAST_CHANCE_SECONDS = 3  # how long it tries once more as it shuts down, if it still has the game
+RECONNECT_MS = (50, 500)  # each page is told to come back after a wait between these, by chance, so they don't all arrive at once
+RECONNECT_AHEAD_FRAMES = 90  # and is first sent this much of the ball's path (1.5 seconds), to play while it does
+GUEST_KEPT_SECONDS = 24 * 60 * 60  # a guest who has been away longer than this isn't handed over, so the players don't pile up for ever
 
 
 def wall_inset(y):
@@ -124,6 +145,19 @@ db = httpx.AsyncClient(
 # Optional: without it those routes don't exist, as far as anyone outside can tell.
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()
 
+# How the old and the new server talk during an update: each asks the site's own address, which
+# reaches whichever of them is taking requests just then (see "The handover" below). The key
+# is worked out from the database key, which both have, so there is nothing more to set up, and
+# the database key itself is never sent. No connection is kept open between requests, so each
+# one is sure to be routed afresh.
+HANDOVER_KEY = hmac.new(os.environ["SUPABASE_KEY"].encode(), b"bouncemarket handover", "sha256").hexdigest()
+peer = httpx.AsyncClient(
+    base_url=PUBLIC_URL or "http://localhost",  # never used without a PUBLIC_URL
+    headers={"Authorization": "Bearer " + HANDOVER_KEY},
+    timeout=3,
+    limits=httpx.Limits(max_keepalive_connections=0),
+)
+
 # Everything below lives in memory, so it resets when the server restarts.
 # The whole server runs on one thread (see the bottom of the file), so none of it needs locks.
 
@@ -132,6 +166,10 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()
 # before the first drop) and "bucket" is where it lands. Pages are sent the path a few
 # frames at a time, and the bucket when the ball lands.
 game = {
+    # Whose game it is (see "The handover" below): "waiting" on a new server until the old one
+    # hands the game over, "live" on the one server running it, "moving" for the moment the old
+    # server is handing it over, and "retired" on the old server from then on.
+    "role": "waiting",
     "dropping": False,
     "drops_at": time.time() + COUNTDOWN_SECONDS,  # when the countdown ends
     "started_at": 0,  # when the ball dropped
@@ -139,10 +177,20 @@ game = {
     "path": None,
     "bucket": None,
     "close_frame": 0,  # betting closes when the ball reaches this frame
+    # The code version and physics options of the server that dropped this ball. They are this
+    # server's own, unless the round was handed over part-way through by the one before.
+    "commit": COMMIT,
+    "gravity": GRAVITY,
+    "bounce": BOUNCE,
     "counterparty": None,  # the counterparty for this drop, a Counterparty, which keeps its own buys
     "sent_frames": 0,  # how many frames of the path have been sent to the pages so far
     "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
     "buys": [],  # every player buy this round, in order, for the round log. See buy()
+    # For the round log's timing (see pack_timing()), in seconds since the drop:
+    # one [built, first written, last written, pages queued, pages written] per broadcast this
+    # round, and one (taken, seen, seen broadcast) per buy, in the same order as "buys".
+    "broadcasts": [],
+    "buy_timing": [],
     "last_bucket": None,  # where the previous ball landed
     "ranking": [],  # every named player, most points first, as [{"name": ..., "points": ...}], made from named_points
     "positions": {},  # each name's index in "ranking", so a player can be found quickly
@@ -155,11 +203,12 @@ game = {
 # One entry per player who has opened the page since the server started, keyed by the
 # random id their browser sends:
 # {"name": None, "points": 10, "shares": {"left": 0, "right": 0}, "spent": 0, "last_won": 0,
-#  "loaded": True, "name_locked": False}
+#  "loaded": True, "name_locked": False, "seen": 1700000000.0}
 # "name" is None until the player claims one. "shares" and "spent" are what the player has
 # bought, and paid for it, in the current round. "loaded" is explained in get_player().
 # "name_locked" is True once the owner has replaced the player's name (see admin_rename()),
-# and stops them changing it themselves.
+# and stops them changing it themselves. "seen" is when they were last here (seconds since
+# 1970): when they first came, last bought, or last closed the page (see handover_snapshot()).
 players = {}
 
 # Every named player's points, {name: points}, for the leaderboard. Loaded from the database
@@ -176,7 +225,14 @@ saved_ids = set()
 recent_buys = {}
 
 # One entry per open page: a queue of messages waiting to be sent to it, and whose page it is.
+# Each message in a queue is (text, tag): tag is (started_at, index) for a broadcast during a
+# drop, so events() can note when it was written (see written_to), and None for anything else.
 streams = {}  # {queue: player_id}
+
+# The newest broadcast of this round written to each player's pages, and when, in seconds since
+# the drop: {player_id: (index in game["broadcasts"], seconds)}. If a player has more than one
+# page open, it is the latest write to any of them. Emptied at every drop. buy() logs it.
+written_to = {}
 
 # The round log gives every player who has ever bought a share a small whole number, their
 # key, and uses it in place of their long id, so each logged buy takes a few bytes.
@@ -185,6 +241,9 @@ player_keys = {}
 
 # Rounds waiting to be saved to the round log, oldest first, each as made by round_log().
 unsaved_rounds = []
+# Whether the rounds table has its timing column, as far as we know: save_rounds() stops
+# sending the timing if the database says it doesn't (schema.sql not run since it was added).
+timing_column = True
 
 # The best-round card. Each player's best round so far, {player_id: record}, for the players
 # whose best we know, each record as made by new_best_rounds(). Only a round that made more
@@ -431,6 +490,20 @@ def leaderboard_message(player):
     return sse("leaderboard", {"top": rows(0, LEADERBOARD_SIZE), "around_me": around_me})
 
 
+def new_player():
+    """A player as they are the first time we see their id: a guest with 10 points."""
+    return {
+        "name": None,
+        "points": 10,
+        "shares": {"left": 0, "right": 0},
+        "spent": 0,
+        "last_won": 0,
+        "loaded": False,
+        "name_locked": False,
+        "seen": time.time(),
+    }
+
+
 async def get_player(player_id):
     """Look up a player, creating them with 10 points the first time we see their id.
 
@@ -447,15 +520,7 @@ async def get_player(player_id):
     writes every change there, and the lookup also brings their name_locked.
     """
     if player_id not in players:
-        players[player_id] = {
-            "name": None,
-            "points": 10,
-            "shares": {"left": 0, "right": 0},
-            "spent": 0,
-            "last_won": 0,
-            "loaded": False,
-            "name_locked": False,
-        }
+        players[player_id] = new_player()
     player = players[player_id]
     if not player["loaded"] and game["ranking_loaded"] and player_id not in saved_ids:
         player["loaded"] = True
@@ -676,10 +741,27 @@ def sse(event, data):
     return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
 
 
-def send(queue, message):
-    """Queue a message for one page. A page that has fallen far behind misses it instead."""
+def send(queue, message, tag=None):
+    """Queue a message for one page. A page that has fallen far behind misses it instead.
+    tag is for broadcasts only (see streams)."""
     if not queue.full():
-        queue.put_nowait(message)
+        queue.put_nowait((message, tag))
+
+
+def note_written(player_id, tag):
+    """Note that a broadcast has just been written to one of this player's pages: handed to
+    the network, as events() only goes on to the next message once the last one is sent."""
+    started_at, index = tag
+    if not game["dropping"] or game["started_at"] != started_at:
+        return  # a broadcast of a round that has ended
+    now = time.time() - started_at
+    record = game["broadcasts"][index]
+    record[1] = now if record[1] is None else min(record[1], now)
+    record[2] = now if record[2] is None else max(record[2], now)
+    record[4] += 1
+    newest = written_to.get(player_id)
+    if newest is None or now >= newest[1]:
+        written_to[player_id] = (index, now)
 
 
 def send_to_player(player_id, message):
@@ -797,6 +879,61 @@ def unpack_buys(data):
     return buys
 
 
+# The round's timing, for working out how fast each player answers what they are sent. All
+# times are in microseconds since the drop, by the clock of the server that took them.
+TIMING_BROADCAST_COLUMNS = (
+    ("built", "I"),  # when broadcast() made the message and queued it for every page
+    ("first", "I"),  # when it was handed to the network for the first page; NO_TIME if for none
+    ("last", "I"),  # and for the last page
+    ("queued", "I"),  # how many pages it was queued for
+    ("written", "I"),  # how many it was written to before the round ended
+)
+TIMING_BUY_COLUMNS = (
+    ("taken", "I"),  # when buy() took the buy, a moment after the request reached the server
+    ("seen", "I"),  # when the newest broadcast of this round was written to the buyer's pages; NO_TIME if none had been
+    ("seen_broadcast", "H"),  # which broadcast that was, counting from 0; NO_BROADCAST if none
+)
+TIMING_HEADER = "<BII"  # TIMING_FORMAT, how many broadcasts, how many buys
+
+
+def pack_timing(broadcasts, buy_timing):
+    """A round's timing as bytes, from game["broadcasts"] and game["buy_timing"], packed by
+    column like pack_buys()."""
+    def micro(seconds):
+        return NO_TIME if seconds is None else min(NO_TIME - 1, max(0, round(seconds * 1_000_000)))
+
+    numbers = [micro(b[0]) for b in broadcasts] + [micro(b[1]) for b in broadcasts] + [micro(b[2]) for b in broadcasts]
+    numbers += [b[3] for b in broadcasts] + [b[4] for b in broadcasts]
+    numbers += [micro(t[0]) for t in buy_timing] + [micro(t[1]) for t in buy_timing]
+    numbers += [NO_BROADCAST if t[2] is None else min(NO_BROADCAST - 1, t[2]) for t in buy_timing]
+    layout = TIMING_HEADER + "".join(f"{len(broadcasts)}{letter}" for name, letter in TIMING_BROADCAST_COLUMNS)
+    layout += "".join(f"{len(buy_timing)}{letter}" for name, letter in TIMING_BUY_COLUMNS)
+    return zlib.compress(struct.pack(layout, TIMING_FORMAT, len(broadcasts), len(buy_timing), *numbers), 9)
+
+
+def unpack_timing(data):
+    """The timing that pack_timing() packed, as {"broadcasts": [(built, first, last, queued,
+    written)], "buys": [(taken, seen, seen_broadcast)]}, the times in seconds since the drop and
+    None where there isn't one. "buys" lines up with the round's buys, in the same order."""
+    data = zlib.decompress(data)
+    version, n_broadcasts, n_buys = struct.unpack_from(TIMING_HEADER, data)
+    if version != TIMING_FORMAT:
+        raise ValueError(f"timing format {version}, which this version of app.py can't unpack")
+    layout = "<" + "".join(f"{n_broadcasts}{letter}" for name, letter in TIMING_BROADCAST_COLUMNS)
+    layout += "".join(f"{n_buys}{letter}" for name, letter in TIMING_BUY_COLUMNS)
+    numbers = struct.unpack_from(layout, data, struct.calcsize(TIMING_HEADER))
+    columns, at = [], 0
+    for count in [n_broadcasts] * len(TIMING_BROADCAST_COLUMNS) + [n_buys] * len(TIMING_BUY_COLUMNS):
+        columns.append(numbers[at:at + count])
+        at += count
+    seconds = lambda micro: None if micro == NO_TIME else micro / 1_000_000
+    built, first, last, queued, written, taken, seen, seen_broadcast = columns
+    return {
+        "broadcasts": [(seconds(b), seconds(f), seconds(l), q, w) for b, f, l, q, w in zip(built, first, last, queued, written)],
+        "buys": [(seconds(t), seconds(s), None if i == NO_BROADCAST else i) for t, s, i in zip(taken, seen, seen_broadcast)],
+    }
+
+
 def to_bytea(data):
     """Bytes in the text form the database takes for a bytea (raw bytes) column: \\x and then hexadecimal."""
     return "\\x" + data.hex()
@@ -814,9 +951,9 @@ def round_log():
         return None
     return {
         "started_at": datetime.datetime.fromtimestamp(game["started_at"], datetime.timezone.utc).isoformat(),
-        "commit_id": COMMIT,
-        "gravity": GRAVITY,
-        "bounce": BOUNCE,
+        "commit_id": game["commit"],
+        "gravity": game["gravity"],
+        "bounce": game["bounce"],
         "start_x": game["start_x"],
         "frames": len(game["path"]),
         "close_frame": game["close_frame"],
@@ -825,6 +962,9 @@ def round_log():
         "rules": RULES_VERSION,
         "path": to_bytea(pack_path(game["path"])),
         "buys": game["buys"],
+        # None if the timing doesn't line up with the buys, which shouldn't happen.
+        "timing": to_bytea(pack_timing(game["broadcasts"], game["buy_timing"]))
+        if len(game["buy_timing"]) == len(game["buys"]) else None,
     }
 
 
@@ -850,16 +990,30 @@ async def save_rounds():
         for row in response.json():
             player_keys[row["id"]] = row["key"]
 
+    global timing_column
     rows = []
     for log in logs:
         buys = [(frame, seen, player_keys[player_id], *rest) for frame, seen, player_id, *rest in log["buys"]]
-        rows.append({**log, "n_buys": len(buys), "buys": to_bytea(pack_buys(buys))})
-    response = await db.post(
-        "/rounds",
-        params={"on_conflict": "started_at"},
-        json=rows,
-        headers={"Prefer": "resolution=ignore-duplicates"},
-    )
+        row = {**log, "n_buys": len(buys), "buys": to_bytea(pack_buys(buys))}
+        if not timing_column:
+            row.pop("timing", None)
+        rows.append(row)
+
+    async def write(rows):
+        return await db.post(
+            "/rounds",
+            params={"on_conflict": "started_at"},
+            json=rows,
+            headers={"Prefer": "resolution=ignore-duplicates"},
+        )
+
+    response = await write(rows)
+    # PGRST204: a column the database doesn't have. The rounds are saved without their timing
+    # rather than not at all, until the server restarts after schema.sql has been run.
+    if response.status_code == 400 and timing_column and "PGRST204" in response.text and "timing" in response.text:
+        timing_column = False
+        print("The rounds table has no timing column: run schema.sql. Saving rounds without their timing until then.")
+        response = await write([{key: value for key, value in row.items() if key != "timing"} for row in rows])
     response.raise_for_status()
     saved = {log["started_at"] for log in logs}
     unsaved_rounds[:] = [log for log in unsaved_rounds if log["started_at"] not in saved]
@@ -964,7 +1118,7 @@ def new_best_rounds():
             "payout": payout,
             "profit": profit,
             # The ball's whole path follows from these, so a replay can play it again (see simulate_drop()).
-            "trajectory": {"start_x": game["start_x"], "gravity": GRAVITY, "bounce": BOUNCE, "commit_id": COMMIT},
+            "trajectory": {"start_x": game["start_x"], "gravity": game["gravity"], "bounce": game["bounce"], "commit_id": game["commit"]},
             "cleared": False,  # True once the player deletes it from their page (see clear_card())
         }
         best_rounds[player_id] = record
@@ -1057,6 +1211,8 @@ async def clear_card(request):
     if player_id not in players:
         return JSONResponse({"error": "unknown player."}, status_code=400)
     async with saving_cards:  # so a save on its way can't land after this and bring a card back
+        if game["role"] != "live":
+            return moved(request)  # the game was handed to a new server while we waited our turn
         try:
             response = await db.patch(
                 "/best_rounds", params={"player": "eq." + player_id, "cleared": "eq.false"}, json={"cleared": True})
@@ -1242,29 +1398,49 @@ async def share_replay(request):
 
 
 async def run_rounds():
-    """The round loop: wait for the countdown, drop a ball, wait for it to land, pay out. Forever."""
+    """The round loop: wait for the countdown, drop a ball, wait for it to land, pay out. Forever,
+    or until the game is handed to a new server (see "The handover" below).
+
+    It picks up from wherever the game is, as a round handed over by the server before may
+    already have its ball in the air: then it starts by waiting for that ball to land.
+    """
     while True:
-        await asyncio.sleep(max(0, game["drops_at"] - time.time()))
-        # Drop from somewhere in the middle two-thirds, so the ball never just slides down a slanted wall.
-        start_x = random.uniform(WIDTH / 6, WIDTH * 5 / 6)
-        states, bucket = simulate_drop(start_x, GRAVITY, BOUNCE)
-        path = positions(states)
-        last_row_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
-        # Pages see BUFFER_FRAMES ahead, so betting closes that long before the ball
-        # passes the last row. Nobody can bet after seeing which side of the divider it took.
-        close_frame = max(0, last_row_frame - BUFFER_FRAMES)
-        game.update(
-            dropping=True,
-            started_at=time.time(),
-            start_x=start_x,
-            path=path,
-            bucket=bucket,
-            close_frame=close_frame,
-            counterparty=Counterparty(path, close_frame, start_x),
-            sent_frames=0,
-            buys=[],
-        )
-        await asyncio.sleep(len(path) * FRAME_SECONDS)
+        if not game["dropping"]:
+            await asyncio.sleep(max(0, game["drops_at"] - time.time()))
+            if not await still_ours():
+                return
+            # Drop from somewhere in the middle two-thirds, so the ball never just slides down a slanted wall.
+            # Rounded to 15 significant digits, as that is all the database gives back: a
+            # double needs 17 to come back exactly, and the path is chaotic, so a replay from
+            # the 15 the round log holds would part from the real drop a few hundred frames in.
+            # Any number of 15 digits does come back exactly, so this is the drop that was played.
+            start_x = float(f"{random.uniform(WIDTH / 6, WIDTH * 5 / 6):.15g}")
+            states, bucket = simulate_drop(start_x, GRAVITY, BOUNCE)
+            path = positions(states)
+            last_row_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
+            # Pages see BUFFER_FRAMES ahead, so betting closes that long before the ball
+            # passes the last row. Nobody can bet after seeing which side of the divider it took.
+            close_frame = max(0, last_row_frame - BUFFER_FRAMES)
+            game.update(
+                dropping=True,
+                started_at=time.time(),
+                start_x=start_x,
+                path=path,
+                bucket=bucket,
+                close_frame=close_frame,
+                commit=COMMIT,
+                gravity=GRAVITY,
+                bounce=BOUNCE,
+                counterparty=Counterparty(path, close_frame, start_x),
+                sent_frames=0,
+                buys=[],
+                broadcasts=[],
+                buy_timing=[],
+            )
+            written_to.clear()
+        await asyncio.sleep(max(0, game["started_at"] + len(game["path"]) * FRAME_SECONDS - time.time()))
+        if not await still_ours():
+            return  # the new server has the round now, and pays it out
         rows = settle()
         new_best_rounds()
         log = round_log()
@@ -1292,6 +1468,42 @@ def rounded(position):
     return [round(position[0], POSITION_DECIMALS), round(position[1], POSITION_DECIMALS)]
 
 
+def public_state():
+    """The state of the game that every page is sent, without the ball: the "game" message
+    is this and, while the ball is falling, its next positions (see broadcast())."""
+    message = {
+        "dropping": game["dropping"],
+        "seconds_to_drop": max(0, game["drops_at"] - time.time()),
+        "prices": prices(),
+        "costs": costs(),  # what the buy buttons charge
+        "betting_open": betting_open(),
+        "online": len(streams),
+        "last_bucket": game["last_bucket"],
+    }
+    if game["update_at"] is not None:
+        # Seconds until the announced update, which the page counts down on its own clock.
+        message["update_in"] = max(0, round(game["update_at"] - time.time()))
+    return message
+
+
+def catch_up():
+    """The "game" message for a page that has just connected: the game as it stands and, if the
+    ball is falling, the positions from where it is now up to the last one everyone else has
+    been sent. broadcast() only ever sends each position once, so without this a page that
+    connects during a drop would be missing a stretch of the path: a page just opened would
+    show no ball for a moment, and a page whose stream was cut and came back, as every page's
+    is when the game moves to a new server, would see the ball freeze and jump. No position is
+    sent here that hasn't gone to every other page already."""
+    message = public_state()
+    if game["dropping"]:
+        frame = current_frame()
+        start = min(frame, game["sent_frames"])
+        message["frame"] = frame
+        message["first_position"] = start
+        message["positions"] = [rounded(position) for position in game["path"][start:game["sent_frames"]]]
+    return sse("game", message)
+
+
 async def broadcast():
     """Send every page the public state of the game: up to 10 times a second, but only as often as needed.
 
@@ -1299,6 +1511,13 @@ async def broadcast():
     it carries the next positions on the path, ahead of time. The page plays them back on its
     own clock, so it always has some in hand and the ball moves smoothly even when the
     network delivers messages unevenly.
+
+    The pages are sent it in a new random order every time. Each page's stream is written in
+    the order its message was queued, and with a thousand pages open the last is written a
+    noticeable moment after the first. In a fixed order, the page that connected first would
+    always hear first, and a script that kept its stream open would always be a step ahead of
+    everyone else. During a drop each broadcast is also numbered, and its timing kept for the
+    round log (see pack_timing()).
 
     Most of the cost of a big game is these messages, so we send as few as we can:
     - Early in the drop, positions go out EARLY_AHEAD_FRAMES ahead, about twice a second.
@@ -1312,6 +1531,8 @@ async def broadcast():
     was_dropping = None
     while True:
         await asyncio.sleep(1 / BROADCASTS_PER_SECOND)
+        if game["role"] == "retired":
+            return  # the game has been handed to a new server, which sends these now
         ticks_since_sent += 1
         path = game["path"]
         dropping = game["dropping"]
@@ -1329,18 +1550,7 @@ async def broadcast():
         ticks_since_sent = 0
         was_dropping = dropping
 
-        message = {
-            "dropping": game["dropping"],
-            "seconds_to_drop": max(0, game["drops_at"] - time.time()),
-            "prices": prices(),
-            "costs": costs(),  # what the buy buttons charge
-            "betting_open": betting_open(),
-            "online": len(streams),
-            "last_bucket": game["last_bucket"],
-        }
-        if game["update_at"] is not None:
-            # Seconds until the announced update, which the page counts down on its own clock.
-            message["update_in"] = max(0, round(game["update_at"] - time.time()))
+        message = public_state()
         if dropping:
             # The positions the pages don't have yet, and the frame number of the first of them.
             # Never past close_frame + BUFFER_FRAMES (the last row) while betting is open, however early it is.
@@ -1354,8 +1564,14 @@ async def broadcast():
             game["sent_frames"] = max(game["sent_frames"], end)
 
         text = sse("game", message)
-        for queue in streams:
-            send(queue, text)
+        tag = None
+        queues = list(streams)
+        random.shuffle(queues)
+        if dropping:
+            tag = (game["started_at"], len(game["broadcasts"]))
+            game["broadcasts"].append([time.time() - game["started_at"], None, None, len(queues), 0])
+        for queue in queues:
+            send(queue, text, tag)
 
 
 async def index(request):
@@ -1395,7 +1611,8 @@ async def events(request):
     """Stream messages to one player's page for as long as it stays open.
 
     The page gets a private "me" message (its name, points and shares) when it connects and
-    after each round, the public "game" message from broadcast(), and its own "leaderboard"
+    after each round, the public "game" message when it connects (see catch_up()) and then
+    from broadcast(), and its own "leaderboard"
     message (the top players, plus the players around it) when it connects and whenever the
     leaderboard is refreshed. If the player has a best-round card, a "card" message brings it
     when the page connects, and again whenever a round becomes their new best.
@@ -1407,6 +1624,10 @@ async def events(request):
     await get_best_round(player_id)
 
     async def stream():
+        if game["role"] == "retired":
+            # The game was handed to a new server while we were looking this player up.
+            yield come_back()
+            return
         queue = asyncio.Queue(maxsize=100)
         streams[queue] = player_id
         try:
@@ -1414,10 +1635,19 @@ async def events(request):
             yield leaderboard_message(player)
             if player_id in best_rounds:
                 yield card_message(best_rounds[player_id], fresh=False)
+            yield catch_up()
             while True:
-                yield await queue.get()
+                item = await queue.get()
+                if item is None:
+                    return  # the game has been handed to a new server: see end_stream()
+                message, tag = item
+                yield message
+                # We get here once the message has been handed to the network.
+                if tag is not None:
+                    note_written(player_id, tag)
         finally:
             del streams[queue]  # the page has gone away
+            player["seen"] = time.time()
 
     # The headers ask anything between the server and the browser not to hold events back.
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
@@ -1445,6 +1675,7 @@ async def buy(request):
     if len(times) >= MAX_BUYS_PER_SECOND:
         return JSONResponse({"error": "too many buys at once, slow down."}, status_code=429)
     times.append(now)
+    player["seen"] = time.time()
     price = costs(frame)[side]
     if price > player["points"]:
         return JSONResponse({"error": "you don't have enough points."}, status_code=400)
@@ -1454,6 +1685,11 @@ async def buy(request):
     if type(seen_frame) is not int or not 0 <= seen_frame < NOT_SEEN:
         seen_frame = NOT_SEEN
     game["buys"].append((frame, seen_frame, player_id, side, price, player["points"]))
+    # For the round log's timing: when the server took this buy, and the newest broadcast it had
+    # written to this player's pages by then, so analysis can tell how long the player took to
+    # answer what they were sent, apart from where their page came in the order of sending.
+    seen_index, seen_at = written_to.get(player_id, (None, None))
+    game["buy_timing"].append((time.time() - game["started_at"], seen_at, seen_index))
     player["points"] = round(player["points"] - price, 2)
     player["spent"] = round(player["spent"] + price, 2)
     player["shares"][side] += 1
@@ -1508,6 +1744,8 @@ async def set_name(request):
             publish_leaderboard()
     try:
         async with saving_players:
+            if game["role"] != "live":
+                return moved(request)  # the game was handed to a new server while we waited our turn
             # Checked again here, as the owner may have locked the name while we waited our turn.
             if player["name_locked"]:
                 return locked
@@ -1695,6 +1933,8 @@ async def admin_rename(request):
         return JSONResponse({"error": "the leaderboard hasn't loaded from the database yet. try again in a minute."}, status_code=503)
 
     async with saving_players:  # so no round's points are saved under the old name meanwhile
+        if game["role"] != "live":
+            return moved(request)  # the game was handed to a new server while we waited our turn
         old_name = stored_name(wanted)
         for attempt in range(5):
             new_name = to if to is not None else made_up_name()
@@ -1757,6 +1997,8 @@ async def admin_unlock(request):
     if not isinstance(wanted, str) or not wanted.strip():
         return JSONResponse({"error": 'say whose name to unlock, as "name".'}, status_code=400)
     async with saving_players:
+        if game["role"] != "live":
+            return moved(request)  # the game was handed to a new server while we waited our turn
         name = stored_name(wanted)
         try:
             rows = await change_player_by_name(name, {"name_locked": False})
@@ -1798,16 +2040,437 @@ async def admin_notice(request):
     return JSONResponse({"notice": "published", "minutes": minutes, "update_at": update_at})
 
 
+# The handover. An update starts a new server beside the old one, and for a minute or so both
+# run: the host (Render) sends every new request to the new server once it is up, while the
+# pages' open streams stay with the old one. The game lives in one server's memory, so it has to
+# move from the old to the new, at that moment, or a page would watch the ball on one server
+# and buy on the other. It goes like this:
+#
+# 1. The new server, before it takes any requests, says hello at the site's own address
+#    (PUBLIC_URL). No request reaches it yet, so the old server answers. The new one now knows
+#    there is a game to wait for (its role is "waiting"), and the old one starts watching.
+# 2. The old server asks the same address "who are you?" twice a second. The first time the new
+#    server answers, the host has switched over.
+# 3. The old server stops changing anything ("moving") and sends the new one everything that
+#    lives only in memory: the round being played, ball in the air and all, every player's
+#    points and shares, the leaderboard, and whatever isn't saved yet (handover_snapshot()).
+# 4. The new server takes it and carries on from the same frame (take_over()). Requests that
+#    reached it before this were kept waiting, a second at most, and are answered now.
+# 5. The old server ends every page's stream ("retired"). Each browser connects again by
+#    itself, which reaches the new server, and the ball carries on from where it was.
+#
+# If any step fails, the game is never left without a server: the old one carries on until the
+# host shuts it down, when it tries once more, and a new server that hears nothing starts a game
+# of its own, into which a late handover is merged. The worst case is what an update used to
+# be: a new game, and guests back on 10 points.
+
+# Set while the game is settled on one server ("live" or "retired"), and clear while that is
+# still being decided ("waiting" or "moving"), which is when requests are kept waiting.
+role_settled = asyncio.Event()
+game_tasks = []  # the round loop and the broadcaster, once this server is running the game
+taken_from = set()  # the servers whose game we have taken, so one sent twice is taken once
+watching = None  # the task watching for a new server to start taking requests, once one has said hello
+
+# What is handed over of the round being played, or of the wait for the next one.
+ROUND_KEYS = (
+    "dropping", "drops_at", "started_at", "start_x", "path", "bucket", "close_frame",
+    "commit", "gravity", "bounce", "sent_frames", "shares", "buys", "broadcasts", "buy_timing", "last_bucket",
+)
+
+
+def set_role(role):
+    game["role"] = role
+    if role in ("live", "retired"):
+        role_settled.set()
+    else:
+        role_settled.clear()
+
+
+async def still_ours():
+    """Whether the game is still this server's to run. The round loop asks before each drop
+    and each payout; while a handover is under way it waits here to see how it ends."""
+    await role_settled.wait()
+    return game["role"] == "live"
+
+
+def go_live():
+    """Start running the game on this server, from wherever the game is."""
+    set_role("live")
+    game_tasks.extend(asyncio.create_task(job) for job in (run_rounds(), broadcast()))
+
+
+def start_afresh():
+    """Start a game of our own, with a full countdown: there was no server before us to take
+    one from, or it never handed its game over."""
+    game["drops_at"] = time.time() + COUNTDOWN_SECONDS
+    go_live()
+
+
+def come_back():
+    """Tells a page's browser how long to wait before it connects again, in the stream's own
+    format. The browser does that by itself whenever its stream ends. Each page gets a different
+    wait, by chance, so a crowd doesn't all arrive in the same instant."""
+    return f"retry: {random.randint(*RECONNECT_MS)}\n\n"
+
+
+def parting_message():
+    """The last "game" message the old server sends before it ends the streams: the ball's next
+    RECONNECT_AHEAD_FRAMES positions, so that on every page the ball keeps falling while the
+    browser connects to the new server. The new server sends these positions again; a page
+    takes no harm from getting one twice.
+
+    While betting is open this keeps to what broadcast() lets a page see, so a handover never
+    shows anyone more of the path than they could have had without one. The end of the path
+    before the close, past the furthest broadcast() sends early on, only ever goes out
+    BUFFER_FRAMES ahead, and nothing past the last row goes out at all. So for a handover in
+    the last second or so before the close, a page gets less than it needs to cover the wait,
+    and the ball may stand still for a moment until it has connected to the new server."""
+    message = public_state()
+    if game["dropping"]:
+        frame = current_frame()
+        end = min(frame + RECONNECT_AHEAD_FRAMES + 1, len(game["path"]))
+        if betting_open(frame):
+            sent_early = game["close_frame"] - FINAL_STRETCH_FRAMES + EARLY_AHEAD_FRAMES
+            end = min(end, max(frame + BUFFER_FRAMES + 1, sent_early), game["close_frame"] + BUFFER_FRAMES)
+        start = min(game["sent_frames"], end)
+        message["frame"] = frame
+        message["first_position"] = start
+        message["positions"] = [rounded(position) for position in game["path"][start:end]]
+    return sse("game", message)
+
+
+def end_stream(queue, parting):
+    """End one page's stream, after a last message and telling its browser when to connect
+    again. Whatever was still waiting to be sent is dropped, as the new server sends everything again."""
+    while not queue.empty():
+        queue.get_nowait()
+    queue.put_nowait((parting, None))
+    queue.put_nowait((come_back(), None))
+    queue.put_nowait(None)  # events() ends the stream when it reaches this
+
+
+def moved(request):
+    """The answer to a request that reached a server the game has left: try again, and the
+    request will reach the new one. A stream is told to connect again, and anything else gets a
+    503 with "moved", at which the page asks again by itself (post() in index.html)."""
+    if request.url.path == "/events":
+        return Response(come_back(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return JSONResponse(
+        {"error": "the game is moving to a new server. try again in a moment.", "moved": True},
+        status_code=503,
+        headers={"Retry-After": "1"},
+    )
+
+
+def ours(handler):
+    """Wraps every route that reads or changes the game, so it only runs on the server that
+    has the game. On a new server still waiting for it, or an old one just handing it over, the
+    request waits, as that takes well under a second. If a new server has waited HOLD_SECONDS
+    and been handed nothing, it starts a game of its own."""
+    async def gated(request):
+        # Read what was sent first, so that nothing is waited for between the check below and
+        # the handler's own work: a buy can't slip in after the game has been handed over.
+        await request.body()
+        if game["role"] in ("waiting", "moving"):
+            try:
+                await asyncio.wait_for(role_settled.wait(), HOLD_SECONDS)
+            except TimeoutError:
+                if game["role"] == "waiting":
+                    print("Nobody handed the game over, so starting a new one.")
+                    start_afresh()
+        if game["role"] != "live":
+            return moved(request)
+        return await handler(request)
+    return gated
+
+
+def handover_refusal(request):
+    """None if the request comes from our own other server, which sends HANDOVER_KEY.
+    Otherwise "Not Found", just as for a page that doesn't exist."""
+    given = request.headers.get("authorization", "")
+    if not hmac.compare_digest(given.encode(), ("Bearer " + HANDOVER_KEY).encode()):
+        return PlainTextResponse("Not Found", status_code=404)
+    return None
+
+
+def other_server(answer):
+    """Whether an answer from the site's address, {"instance": ...}, came from a server other than this one."""
+    return isinstance(answer, dict) and answer.get("instance") not in (None, INSTANCE)
+
+
+async def health(request):
+    """Says this server is up, and which one it is. Render asks, to know when a new server is
+    ready for requests, and the old server asks during an update, to know when the new one has
+    started getting them (see watch_for_successor())."""
+    return JSONResponse({"instance": INSTANCE}, headers={"Cache-Control": "no-store"})
+
+
+async def find_predecessor():
+    """When this server starts, before it takes requests: ask at the site's address whether a
+    server is running the game. Returns its name, or None if there isn't one, which is also the
+    answer when it is too old to know about handovers, or can't be reached in three tries.
+
+    A server that is itself still waiting for the game counts: with two updates close together
+    it is the one that will have the game by the time requests come to us, and it hears of us
+    when we say hello again (see keep_saying_hello())."""
+    if not PUBLIC_URL:
+        return None
+    for attempt in range(3):
+        try:
+            response = await peer.post("/handover/hello", json={"instance": INSTANCE})
+            if response.status_code < 500:
+                answer = response.json() if response.status_code == 200 else None
+                if other_server(answer) and answer.get("role") in ("live", "moving", "waiting"):
+                    return answer["instance"]
+                return None
+        except (httpx.HTTPError, ValueError) as error:
+            print("Could not ask for the server before us:", repr(error))
+        await asyncio.sleep(1)
+    return None
+
+
+async def keep_saying_hello():
+    """On a new server, for as long as it waits for the game: say hello again every
+    HELLO_SECONDS. The server that ends up handing us the game may not be the one that heard
+    us the first time. With two updates close together, it is the server of the update before
+    ours, which was itself still waiting when we started."""
+    while game["role"] == "waiting":
+        await asyncio.sleep(HELLO_SECONDS)
+        if game["role"] == "waiting":
+            with contextlib.suppress(httpx.HTTPError):
+                await peer.post("/handover/hello", json={"instance": INSTANCE})
+
+
+async def handover_hello(request):
+    """A new server, just started and not yet taking requests, asks who is running the game.
+    If that's us, we start watching for the moment it does take them."""
+    global watching
+    refusal = handover_refusal(request)
+    if refusal:
+        return refusal
+    if game["role"] == "live" and (watching is None or watching.done()):
+        print("A new server has started. Watching for it to take over.")
+        watching = asyncio.create_task(watch_for_successor())
+    return JSONResponse({"instance": INSTANCE, "role": game["role"]})
+
+
+async def watch_for_successor():
+    """On the old server, once a new one has said hello: ask the site's address who answers
+    there, every PROBE_SECONDS. While that is still us, requests are still coming to us. The
+    first time it's another server, the host has switched over, and we hand the game on."""
+    deadline = time.monotonic() + WATCH_SECONDS
+    tries = 0
+    while game["role"] == "live" and tries < HAND_OVER_TRIES and time.monotonic() < deadline:
+        await asyncio.sleep(PROBE_SECONDS)
+        try:
+            answer = (await peer.get("/health")).json()
+        except (httpx.HTTPError, ValueError):
+            continue
+        if other_server(answer):
+            tries += 1
+            if await hand_over(HAND_OVER_SECONDS) != "unreachable":
+                return
+
+
+def handover_snapshot():
+    """Everything the next server needs to carry on the game exactly where it is.
+
+    The players sent are everyone with a page open, everyone holding shares in this round,
+    every named player, and the guests who have played and were last here within
+    GUEST_KEPT_SECONDS. A visitor who only looked, and left, is the same made afresh. A guest
+    who left longer ago is forgotten here, as every guest used to be at every update:
+    otherwise the players would be handed from server to server for ever, and only grow.
+    Times are the clock's own (seconds since 1970), which both servers' clocks agree on
+    closely enough.
+    """
+    online = set(streams.values())
+    now = time.time()
+
+    def kept(player_id, player):
+        if player_id in online or player["name"] or player["spent"] or any(player["shares"].values()):
+            return True
+        played = player["points"] != 10 or player["last_won"]
+        return played and now - player["seen"] < GUEST_KEPT_SECONDS
+
+    return {
+        "format": HANDOVER_FORMAT,
+        "from": INSTANCE,
+        "rules": RULES_VERSION,
+        "game": {key: game[key] for key in ROUND_KEYS},
+        "players": {player_id: player for player_id, player in players.items() if kept(player_id, player)},
+        "named_points": named_points if game["ranking_loaded"] else None,
+        "unsaved_rounds": unsaved_rounds,
+        "unsaved_cards": unsaved_cards,
+    }
+
+
+async def hand_over(seconds):
+    """Hand the game to the new server, trying for up to this many seconds. Returns "taken",
+    "refused" (it answered, but can't take this game: it reads a different HANDOVER_FORMAT),
+    or "unreachable". Unless it was taken, the game carries on here.
+
+    Both saving locks are held throughout, so no change of name or deleted card is half-way
+    to the database as the game moves: what is sent is everything, and nothing changes here
+    after it. Requests that arrive meanwhile wait (see ours()), and so does the round loop.
+    """
+    async with saving_players, saving_cards:
+        if game["role"] != "live":
+            return "unreachable"
+        set_role("moving")
+        outcome = "unreachable"
+        try:
+            body = zlib.compress(json.dumps(handover_snapshot()).encode())
+            deadline = time.monotonic() + seconds
+            while outcome == "unreachable" and time.monotonic() < deadline:
+                try:
+                    response = await peer.post("/handover/take", content=body)
+                    answer = response.json()
+                except (httpx.HTTPError, ValueError):
+                    answer = None
+                if other_server(answer):
+                    outcome = "taken" if response.status_code == 200 and answer.get("took") else "refused"
+                else:
+                    await asyncio.sleep(0.25)  # the request came back to us, or nowhere: the switch isn't complete yet
+        except BaseException as error:
+            # Stopped part-way (the server is shutting down), or something that shouldn't go
+            # wrong did. The game is still ours, and mustn't be left frozen.
+            print("Could not hand the game over:", repr(error))
+            set_role("live")
+            raise
+        if outcome != "taken":
+            print(f"Could not hand the game over: {outcome}.")
+            set_role("live")
+            return outcome
+        print(f"Handed the game to the new server, {answer['instance']}, with {len(streams)} pages open.")
+        set_role("retired")
+        # The new server saves these now. Writing them from here as well could undo something
+        # a player does there, such as deleting a card.
+        unsaved_rounds.clear()
+        unsaved_cards.clear()
+        parting = parting_message()
+        for queue in streams:
+            end_stream(queue, parting)
+        return outcome
+
+
+async def handover_take(request):
+    """The old server hands us the game, as made by handover_snapshot() and squeezed with zlib."""
+    refusal = handover_refusal(request)
+    if refusal:
+        return refusal
+    try:
+        handed = json.loads(zlib.decompress(await request.body()))
+    except (zlib.error, ValueError):
+        return JSONResponse({"error": "couldn't read that."}, status_code=400)
+    readable = isinstance(handed, dict) and handed.get("format") == HANDOVER_FORMAT
+    # Not from ourselves (the old server's request can come back to it, mid-switch), and not
+    # if we are the old server, with a game of our own on its way out.
+    if not readable or handed.get("from") == INSTANCE or game["role"] not in ("waiting", "live"):
+        return JSONResponse({"instance": INSTANCE, "took": False}, status_code=409)
+    if handed["from"] not in taken_from:  # the old server sends it again if our answer got lost
+        taken_from.add(handed["from"])
+        take_over(handed)
+    return JSONResponse({"instance": INSTANCE, "took": True})
+
+
+def take_over(handed):
+    """Carry on the game the old server handed us.
+
+    Normally we have been waiting for it, with no game of our own. Then everything is taken as
+    it is, the round being played included, and the round loop starts from there: the same
+    ball, at the same frame, with the same shares. The counterparty isn't sent. It is made
+    again from the path and the buys, which always gives the same counterparty (see Counterparty).
+
+    Their round is called off, and everyone's shares in it refunded, in two cases: if we play
+    by different rules (RULES_VERSION), as a round can't change rules half-way, or if we gave
+    up waiting and have a game of our own running. In that second case the players are merged
+    into ours: a guest who has already come to us started here on 10 points, so the points
+    they had with the old server take the place of those 10. A named player we already hold
+    was loaded from the database, where their points are saved after every round.
+    """
+    theirs = handed["game"]
+    waiting = game["role"] == "waiting"
+    carry_on = waiting and theirs["dropping"] and handed["rules"] == RULES_VERSION
+    for player_id, carried in handed["players"].items():
+        player = new_player()
+        player.update({key: carried[key] for key in player if key in carried})
+        if not carry_on:
+            player["points"] = round(player["points"] + player["spent"], 2)
+            player["shares"], player["spent"] = {"left": 0, "right": 0}, 0
+        mine = players.get(player_id)
+        if mine is None:
+            players[player_id] = player
+        elif mine["name"] is None and player["name"] is None:
+            mine["points"] = round(mine["points"] + player["points"] - 10, 2)
+        if player["name"]:
+            saved_ids.add(player_id)
+
+    known = {log["started_at"] for log in unsaved_rounds}
+    unsaved_rounds.extend(log for log in handed["unsaved_rounds"] if log["started_at"] not in known)
+    known = {card["share_id"] for card in unsaved_cards}
+    for card in handed["unsaved_cards"]:
+        if card["share_id"] not in known:
+            unsaved_cards.append(card)
+        # A card this new isn't in the database yet, where get_best_round() would look for it.
+        best = best_rounds.get(card["player"])
+        if not card["cleared"] and (best is None or card["profit"] > best["profit"]):
+            best_rounds[card["player"]] = card
+            card_holders.add(card["player"])
+
+    if not waiting:
+        print(f"Merged {len(handed['players'])} players from the old server, {handed['from']}, into the game already running here.")
+        for queue, player_id in streams.items():
+            send(queue, sse("me", players[player_id]))
+        publish_leaderboard()
+        return
+    if handed["named_points"] is not None:
+        # The old server's leaderboard is newer than what we read from the database as we started.
+        named_points.clear()
+        named_points.update(handed["named_points"])
+    if carry_on:
+        game.update({key: theirs[key] for key in ROUND_KEYS})
+        game["counterparty"] = Counterparty(game["path"], game["close_frame"], game["start_x"])
+    else:
+        game["last_bucket"] = theirs["last_bucket"]
+        # Between rounds, their countdown carries on. A round called off starts a new countdown.
+        game["drops_at"] = time.time() + COUNTDOWN_SECONDS if theirs["dropping"] else max(theirs["drops_at"], time.time())
+    state = "carrying on its round" if carry_on else "its round called off" if theirs["dropping"] else "between rounds"
+    print(f"Took over the game from the old server, {handed['from']}: {len(handed['players'])} players, {state}.")
+    go_live()
+    publish_leaderboard()
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
-    """When the server starts: load the leaderboard, and start the round loop, the broadcaster
-    and the saving of the round log.
-    The game starts straight away, even if the leaderboard takes a few tries to load."""
-    jobs = [load_ranking(), load_card_holders(), run_rounds(), broadcast(), save_round_logs(), save_cards_forever()]
+    """When the server starts: load the leaderboard, start saving the round log and the cards,
+    and either wait to be handed the game by the server before us (see "The handover" above) or,
+    if there isn't one, start the round loop and the broadcaster straight away, even if the
+    leaderboard takes a few tries to load.
+
+    When it stops: if it still has the game, try once more to hand it to a new server, then
+    save what is left to save.
+    """
+    jobs = [load_ranking(), load_card_holders(), save_round_logs(), save_cards_forever()]
     tasks = [asyncio.create_task(job) for job in jobs]
+    predecessor = await find_predecessor()
+    if predecessor:
+        print(f"Waiting to be handed the game by the old server, {predecessor}.")
+        tasks.append(asyncio.create_task(keep_saying_hello()))
+    else:
+        start_afresh()
     yield
-    for task in tasks:
+    if watching:
+        tasks.append(watching)
+    for task in tasks + game_tasks:
         task.cancel()
+    await asyncio.gather(*tasks, *game_tasks, return_exceptions=True)  # all stopped, so nothing changes under the handover
+    if PUBLIC_URL and game["role"] == "live":
+        with contextlib.suppress(Exception):  # whatever goes wrong, still save what is left below
+            await hand_over(LAST_CHANCE_SECONDS)
+    for save, unsaved in ((save_rounds, unsaved_rounds), (save_cards, unsaved_cards)):
+        if unsaved:
+            with contextlib.suppress(httpx.HTTPError, KeyError):
+                await save()
 
 
 app = Starlette(
@@ -1821,15 +2484,19 @@ app = Starlette(
         Route("/r/{share_id}/replay", share_replay),
         Route("/r/{share_id}", share_page),
         Route("/board", board),
-        Route("/events", events),
-        Route("/buy", buy, methods=["POST"]),
-        Route("/name", set_name, methods=["POST"]),
-        Route("/reset", reset_points, methods=["POST"]),
-        Route("/card/clear", clear_card, methods=["POST"]),
-        Route("/admin/names", admin_names),
-        Route("/admin/rename", admin_rename, methods=["POST"]),
-        Route("/admin/unlock", admin_unlock, methods=["POST"]),
-        Route("/admin/notice", admin_notice, methods=["POST"]),
+        Route("/health", health),
+        # ours() keeps these to the one server that has the game: see "The handover" above.
+        Route("/events", ours(events)),
+        Route("/buy", ours(buy), methods=["POST"]),
+        Route("/name", ours(set_name), methods=["POST"]),
+        Route("/reset", ours(reset_points), methods=["POST"]),
+        Route("/card/clear", ours(clear_card), methods=["POST"]),
+        Route("/admin/names", ours(admin_names)),
+        Route("/admin/rename", ours(admin_rename), methods=["POST"]),
+        Route("/admin/unlock", ours(admin_unlock), methods=["POST"]),
+        Route("/admin/notice", ours(admin_notice), methods=["POST"]),
+        Route("/handover/hello", handover_hello, methods=["POST"]),
+        Route("/handover/take", handover_take, methods=["POST"]),
     ],
     lifespan=lifespan,
 )

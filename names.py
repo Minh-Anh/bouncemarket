@@ -45,8 +45,9 @@ NUMBERS_AS_L = str.maketrans("0134578", "oleastb")
 
 # Inside the word filter, each letter also matches the numbers and letters that are used to
 # disguise it. u matches v because of spellings like "fvck".
+# q matches g for spellings like "niqqa", and 9 matches i for "n9gger".
 LOOKALIKES = {
-    "a": "a4", "b": "b8", "e": "e3", "g": "g69", "i": "i1", "l": "l1",
+    "a": "a4", "b": "b8", "e": "e3", "g": "g69q", "i": "i19", "l": "l1",
     "o": "o0", "s": "s5", "t": "t7", "u": "uv", "z": "z2",
 }
 
@@ -62,22 +63,29 @@ def words(text):
 ANYWHERE = words("""
     # Racial and ethnic slurs
     nigger nigga niggah nigguh niglet nignog sandnigger
+    niggr neigger natehigger   # a letter dropped or swapped, and the "Nate Higgers" pun
     wetback raghead towelhead jigaboo porchmonkey junglebunny zipperhead chingchong
-    spearchucker cameljockey pickaninny slanteye kaffir golliwog redskin
+    spearchucker cameljockey pickaninny slanteye kaffir golliwog redskin pajeet
+
+    # Religious hatred
+    fukkjew killjew hatejew alohasnackbar allahsnackbar allahusnackbar
 
     # Homophobic and transphobic slurs
-    faggot faggit fagget tranny trannie shemale fudgepacker carpetmuncher battyboy poofter
+    faggot faggit fagget fagut fagit tranny trannie shemale fudgepacker carpetmuncher battyboy poofter
+    pidor pidril pidaras   # Russian
 
     # Ableist slurs
-    retard mongoloid
+    retard rtard mongoloid
 
     # Strong profanity, including the usual misspellings
-    fuck fck phuck cunt bitch wanker asshole arsehole bollocks bellend douchebag
-    motherf cocksuck dicksuck dickhead dickface shithead shitface shithole shitlord shitpost
-    bullshit dipshit
+    fuck fck phuck fucc cunt bitch wanker wanking asshole arsehole bollocks bellend douchebag
+    motherf madafak cocksuck dicksuck dickhead dickface shithead shitface shithole shitlord shitpost
+    bullshit dipshit butthole
+    putana puttana sosihui   # Italian and Russian
 
     # Explicit sexual terms
-    porn penis vagina clitoris masturbat orgasm dildo jizz blowjob handjob rimjob buttplug
+    porn penis vagina clitoris masturbat masterbat masterbait mastarbat orgasm dildo jizz
+    blowjob handjob rimjob buttplug bigdick bigdik
     gangbang bukkake fellatio cunnilingus hentai cumshot cumslut cumdump analsex buttsex
     titties slut whore skank smegma felch queef nutsack ballsack incest bestiality
     zoophil necrophil
@@ -104,6 +112,7 @@ INNOCENT = words("""
     whittl       # whittle, Whittler (hitler with a doubled t)
     swank        # swanky, swanker
     slutsk       # Slutsk, a town in Belarus, and the surname Slutsky
+    masterbatch  # a plastics term (masterbat with "ch" after it)
 """)
 
 # Words that are only offensive as a whole word, because they also hide inside ordinary ones:
@@ -115,6 +124,8 @@ WHOLE_WORD = words("""
     # Racial and ethnic slurs
     nig nigs kike kikes spic spics spick chink chinks gook gooks coon coons
     wop wops jap japs paki pakis darkie darky beaner beaners yid yids heeb squaw injun
+    nigers nigha nighas nogger noggers   # not anywhere, because of Niger, Nigeria and "snogger"
+    hohol khokhol   # Russian, for Ukrainians
 
     # Homophobic slurs
     fag fags faggy dyke dykes
@@ -124,6 +135,7 @@ WHOLE_WORD = words("""
 
     # Profanity
     fuk fukk fuq   # not anywhere in a name, because of Japanese names like Fukuda and Fukushima
+    chuj chuja eblan ebanoe   # Polish and Russian; "eban" alone is in Lebanon
     ass asses arse shit shits shite shitty shitter twat twats wank wanks bastard bastards
 
     # Sexual terms

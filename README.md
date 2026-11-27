@@ -43,6 +43,8 @@ The app is hosted on [Render](https://render.com), which reads `render.yaml`, in
 
 When an update changes `schema.sql`, run it in the Supabase SQL editor before pushing. The old code doesn't mind the additions, and the new code may need them (see [Moderating names](#moderating-names) for what happens if it is pushed first).
 
+An update doesn't stop the game: the old server hands it to the new one, ball in the air and all, and the open pages follow. See [Updating without stopping the game](#updating-without-stopping-the-game).
+
 ## How to play
 
 Everyone who opens the page watches the same ball and trades in the same market. A new ball drops 5 seconds after the last one lands.
@@ -96,7 +98,7 @@ The server runs one game for everyone. It simulates each drop in full the moment
 
 Every open page holds one stream from the server (as [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)) carrying two kinds of message:
 
-- A public "game" message, identical for every player: the countdown, the price of each side, the seconds until an announced update if there is one (see [Announcing an update](#announcing-an-update)), and while the ball is falling, its next positions. It is sent only as often as needed, because at scale these messages are most of the server's work and bandwidth: twice a second early in a drop, 10 times a second for the last 1.5 seconds before betting closes and until the ball lands, once a second between drops, and straight away when a drop starts or the ball lands.
+- A public "game" message, identical for every player: the countdown, the price of each side, the seconds until an announced update if there is one (see [Announcing an update](#announcing-an-update)), and while the ball is falling, its next positions. It is sent only as often as needed, because at scale these messages are most of the server's work and bandwidth: twice a second early in a drop, 10 times a second for the last 1.5 seconds before betting closes and until the ball lands, once a second between drops, and straight away when a drop starts or the ball lands. Each time, the pages are sent it in a new random order. With a thousand pages open the last is written a noticeable moment after the first, and in a fixed order (the order pages connected) the same page would always hear first. A page is also sent one of its own when it connects, with the ball's positions from where it is now, so a page opened during a drop shows the ball at once.
 - A private "me" message with your name, points and shares, and `name_locked`, which is true if the owner has locked your name, sent when you connect, after each round, and when the owner changes your name. Buying a share, setting a name and resetting return the same information.
 - A "leaderboard" message with the top 10 named players, sent when you connect and after each round. If you're ranked below the top 10, it also has the two players either side of you, which the page shows under a "…" with your row in yellow. The server reads every named player's id and points from the database once when it starts, then keeps the ranking up to date in memory: it is the only thing that changes anyone's points, so it never needs to read them again.
 
@@ -108,7 +110,7 @@ Your browser remembers a random id that tells the server which player you are. W
 
 If the database can't be reached, the game carries on: everyone can still play, but names can't be claimed and saved points aren't loaded until it is back.
 
-Players without a name live only in the server's memory, and lose their points when it restarts. Once you claim a name, your id, name and points are a row in the Supabase `players` table. The server saves your points there after every round you play in, and loads them back the next time your browser connects.
+Players without a name live only in the server's memory. An update carries them over to the new server (see [Updating without stopping the game](#updating-without-stopping-the-game)); they lose their points only if the server stops with no new one to hand them to, such as after a crash, or if an update comes more than a day after they were last here and they hold no shares (`GUEST_KEPT_SECONDS` in `app.py`), so that old guests don't pile up for ever. Once you claim a name, your id, name and points are a row in the Supabase `players` table. The server saves your points there after every round you play in, and loads them back the next time your browser connects.
 
 The database is asked about a player only when it can't already know the answer. The read at startup gives the server the id of every player with a row, and it adds to that list as players claim names. So once that read has worked, a browser id that isn't on the list is a new visitor with nothing saved, and their page starts without the database being asked anything: a big crowd arriving at once costs the database nothing. A player who does have a row is looked up the first time they connect after a restart, for their name, points and lock, and not again until the next restart. Until the startup read has worked (in the first moment after a restart, or while the database is down, when it is tried again every 30 seconds) the server can't tell newcomers from returning players, so it looks up every player as they connect. Claiming a first name also looks the player up once more just before writing the row, in case the row was written moments ago by the previous server, which keeps running for a little while during a deploy; otherwise the new row would overwrite it.
 
@@ -172,11 +174,11 @@ The errors are `400` for a bad request or a `"to"` that breaks the username rule
 
 The `name_locked` column must exist before these work: run `schema.sql` again (it only adds what is missing). If the new code runs before the column exists, the game itself is unaffected, as the server reads each player's row without naming the column and treats a missing one as "not locked". Only renaming and unlocking fail, with an answer saying to run `schema.sql`.
 
-Avoid moderating during a deploy: for a minute or so the previous server is still running, and it may save a round's points under the old name, undoing the change. If that happens, rename again once the deploy has finished.
+During a deploy, a command can reach the old server just as it hands the game over. It then answers `503` with `"moved": true` and has changed nothing: run the command again. If a handover fails (see [Updating without stopping the game](#updating-without-stopping-the-game)), the previous server keeps running for a minute or so and may save a round's points under the old name, undoing a rename made meanwhile. If that happens, rename again once the deploy has finished.
 
 ## Announcing an update
 
-A deploy restarts the server, and guests (players without a username) lose their points. To warn them first, put up a banner on every open page that counts down to the update. With `ADMIN_KEY` and `SITE` set as above, for an update in 15 minutes:
+An update normally carries everyone's points over to the new server (see [Updating without stopping the game](#updating-without-stopping-the-game)). It can't when the old server doesn't know how to hand over, or the new one can't read what it is handed: the first deploy of the handover code itself, and any deploy that changes `HANDOVER_FORMAT`. Then guests (players without a username) lose their points, as they do if a handover fails. To warn them first, put up a banner on every open page that counts down to the update. With `ADMIN_KEY` and `SITE` set as above, for an update in 15 minutes:
 
 ```
 curl -s -X POST "$SITE/admin/notice" -H "Authorization: Bearer $ADMIN_KEY" \
@@ -185,7 +187,35 @@ curl -s -X POST "$SITE/admin/notice" -H "Authorization: Bearer $ADMIN_KEY" \
 
 Every page then shows "System update in 15 minutes, all non-named player scores may be wiped. If you would like to save your points, choose a username before the update.", counting down a minute at a time, with "choose a username" opening the username dialog for guests. When the time is up it says the update is starting now. It answers `{"notice": "published", "minutes": 15, "update_at": "..."}`. `minutes` can be any number from 0 to 1440, fractions included, and sending a new one restarts the countdown. Send `{"minutes": 0}` to take the banner down.
 
-The banner lives only in the server's memory, so the deploy it announces takes it down. Pages that connect while it is up see it within a second.
+The banner lives only in the server's memory and isn't handed over, so the deploy it announces takes it down. Pages that connect while it is up see it straight away.
+
+## Updating without stopping the game
+
+Render updates a service blue-green: it starts a new server beside the old one, sends every new request to the new one once it is up, and stops the old one a minute later. Open streams stay with the old server for that minute. The game lives in one server's memory, so on its own this would split it: a page would watch the ball on the old server while its buys went to the new one, which has never heard of the player, and a minute later every page would land in a different game, guests back on 10 points.
+
+So the old server hands the game over at the moment of the switch:
+
+1. The new server, before it takes any requests, says hello at the site's own address. No request reaches it yet, so the old server answers. The new one now waits for the game without starting one of its own, and the old one starts watching.
+2. Twice a second, the old server asks the site's address "which server are you?" (`/health`). The first time the new server answers, Render has switched over.
+3. The old server stops changing anything and sends the new one everything that lives only in memory: the round being played (the ball's path, where it will land, every buy), each player's points and shares, the leaderboard, and any round or card not saved yet.
+4. The new server carries on from the same frame. Requests that reached it before then were kept waiting, and are answered now.
+5. The old server sends each page the next second and a half of the ball's path, then ends its stream. The browser connects again by itself, between 0.05 and 0.5 seconds later, each page after a different wait so they don't all arrive at once, and reaches the new server.
+
+Rehearsed on one computer with 20 pages, every page was back on a stream within 0.7 seconds of the switch, and none missed a frame of the ball's path. A player sees nothing: the ball keeps falling, their shares and points are as they were, and a buy made in that moment waits a fraction of a second longer for its answer. The round is paid out and logged by the new server, once, under the old server's `commit_id`, as that is the code that dropped the ball. Only a handover in the last second or so before trading closes can show. A handover never shows a page more of the ball's path than it could have seen without one, and near the close that is only 0.2 seconds ahead, so the ball may stand still for a moment, up to about half a second, until the page has reconnected.
+
+It needs nothing set up on Render. The servers find each other through `RENDER_EXTERNAL_URL`, which Render sets, and prove who they are with a key worked out from `SUPABASE_KEY`, which both have. `render.yaml` sets `healthCheckPath: /health`; if the service was made before that line was there, set the health check path to `/health` in the Render dashboard too. Anywhere else, set `PUBLIC_URL` to the address the site is reached at. Without either there are no handovers, which is how it runs on your own computer. There must only ever be one instance of the service, as before: the game is one server's memory.
+
+Three things to know:
+
+- **The first deploy of this code restarts the game as before.** The old server is the one that hands over, and the one running now doesn't know how. Every deploy after that hands over. [Announce](#announcing-an-update) this one if guests should be warned.
+- **A change of rules calls off the round in the air.** If the new code has a different `RULES_VERSION`, the round can't change rules half-way, so everyone's shares in it are refunded and a new countdown starts. Everything else carries over.
+- **A change to what is handed over** in a way the new code can't read means changing `HANDOVER_FORMAT` in `app.py`. That one deploy then restarts the game as before.
+
+If a step fails, the game is never left without a server. The old server carries on if it can't deliver the game, tries twice more, and tries a last time when Render tells it to stop. A new server that has waited 5 seconds with requests held and been handed nothing starts a game of its own, and a handover that arrives later is merged into it: the old round is refunded and the players' points follow them. The worst case is what an update used to be.
+
+The servers say what happened in Render's logs. The old one: `A new server has started. Watching for it to take over.` and then `Handed the game to the new server, <name>, with 12 pages open.` The new one: `Waiting to be handed the game by the old server, <name>.` and then `Took over the game from the old server, <name>: 14 players, carrying on its round.`
+
+The code is under "The handover" in `app.py`.
 
 ## The round log
 
@@ -196,17 +226,20 @@ Each is one row of the `rounds` table:
 | Column | Meaning |
 | ------ | ------- |
 | `started_at` | When the ball dropped. |
-| `commit_id` | The version of the code that played the round (Render's `RENDER_GIT_COMMIT`, or `local`). |
-| `gravity`, `bounce` | The physics options the server was running with. |
-| `start_x` | Where along the top the ball dropped from. |
+| `commit_id` | The version of the code that dropped the ball (Render's `RENDER_GIT_COMMIT`, or `local`). A round handed over during an update keeps the old server's. |
+| `gravity`, `bounce` | The physics options the ball was dropped with. |
+| `start_x` | Where along the top the ball dropped from, to 15 significant digits. |
 | `frames`, `close_frame` | How many frames (60 a second) the ball took to land, and the frame betting closed at. |
 | `bucket` | Where the ball landed. |
 | `path` | The ball's position at every frame, packed. |
 | `buys`, `n_buys` | Every buy, in order, packed, and how many there are. |
 | `format` | How `path` and `buys` are packed (`LOG_FORMAT` in `app.py`). |
 | `rules` | Which pricing and counterparty rules the round was played by (`RULES_VERSION` in `app.py`). Rounds logged before the column existed are 1: each side's price was its fraction of all shares bought, and the counterparty bought one share at a time on whichever half the ball was in. In 2, prices follow the logistic curve and the counterparty is today's pretend traders, but a share was charged the price before the buy. 3 charges the market maker's cost of the buy instead. `analysis.py` keeps all three, so old rounds still read back right. |
+| `timing` | When each broadcast went out and each buy was taken, to the microsecond, packed (see [Timing](#timing)). Empty for rounds logged before the column existed. |
 
 A drop is decided entirely by `start_x`, `gravity` and `bounce`: the same three numbers give exactly the same path on any computer. So the analysis plays each round again to get the ball's exact position and velocity at every frame, and nothing about the ball is stored per buy. The saved `path` (under a kilobyte) is there to check the replay against, and to fall back on if the physics in `app.py` ever changes. If it does, a round still replays under the version in its `commit_id`.
+
+The database gives `start_x` back to 15 significant digits, where a number like it needs 17 to come back exactly, and the path is chaotic: a replay from 15 digits parts from the real drop a few hundred frames in. So the server rounds `start_x` to 15 digits before it drops the ball, and the drop that is played is the one that is saved. Rounds logged before that was done mostly don't replay to their saved path; `analysis.py` says how many, and falls back on the saved path for their positions. Their counterparty buys, worked out again from `start_x`, can be off by a share or two as well.
 
 For each buy, the log keeps the server's frame when it took the buy, the frame the player's page said it was showing when the button was pressed (a little earlier, and what the player was actually looking at), who bought, which side, the price paid, and the player's points just before. The page's frame is the page's word, so it's only good for analysis. Everything else about the market at that moment follows from the buys before it and the path: the counterparty's buys are worked out again from the path, where the ball dropped from and the players' buys (its traders' timing has chance in it, but seeded from where the ball dropped, so it comes out the same), and the price from the shares.
 
@@ -214,15 +247,26 @@ The buys are nearly all of what gets stored (a thousand players buying three sha
 
 Rounds are saved a second or so after they finish, by a separate task, so a slow database never holds up the game. If the database can't be reached, up to 20 rounds wait in memory and are saved when it is back.
 
+### Timing
+
+Frames are a sixtieth of a second, too coarse to tell who answers fastest, so each round also keeps its timing, in microseconds since the drop by the server's clock (`pack_timing()` in `app.py`):
+
+- For each broadcast during the drop: when it was made, when it was written to the first page and to the last, and how many pages it was queued for and written to. "Written" is when the server handed it to the network for that page, which comes in the broadcast's random order.
+- For each buy, in the same order as the buys: when the server took it, and the newest broadcast of the round that had been written to the buyer's pages by then, and when.
+
+The time from that write to the buy is how long the player took to answer what they had just been sent: their network, there and back, plus however long their own page or program took. It no longer includes where their page came in the order of sending, which is measured separately. A player whose answer is always fast at the start of a drop (when there is nothing to work out but "it has started") has a fast network; one who is also fast once there is a price to weigh has fast code too. The server can't see further into a player's network than that, as Render's proxy stands between them.
+
+The `timing` column must exist before it is saved: run `schema.sql` again before pushing. If the new code runs first, rounds are saved without their timing, the server says so in its log, and it tries again with timing after its next restart.
+
 ### Reading it back
 
 ```
 uv run --env-file .env analysis.py buys.csv
 ```
 
-writes one line per buy ever made: the round, the player (their key, and their name if they have one), the frame, the side, the price, their points, the ball's position and velocity at the server's frame and at the frame the page was showing, the shares players and the counterparty had bought on each side just before, where the ball landed, and what the share made. End the file name in `.gz` to have it compressed. The top of `analysis.py` lists the columns.
+writes one line per buy ever made: the round, the player (their key, and their name if they have one), the frame, the side, the price, their points, the ball's position and velocity at the server's frame and at the frame the page was showing, the shares players and the counterparty had bought on each side just before, where the ball landed, what the share made, and from the round's timing, when the buy was taken to the microsecond, how long the player took to answer the newest broadcast they had been sent, and how long that broadcast took to reach their page in its sending order. End the file name in `.gz` to have it compressed. The top of `analysis.py` lists the columns.
 
-It also says if any rounds didn't replay to the path that was saved, or if any buys weren't at the price today's `app.py` would charge. Either means the rules have changed since those rounds were played.
+It also says if any rounds didn't replay to the path that was saved, or if any buys weren't at the price today's `app.py` would charge. Either means the rules have changed since those rounds were played, or they were played before `start_x` was rounded (see above).
 
 To work with whole rounds in Python instead, `analysis.rounds()` gives each one with its path, its exact state at every frame, and its buys.
 

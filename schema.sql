@@ -58,6 +58,11 @@ alter table rounds enable row level security;
 -- before it existed were version 1: see prices_v1() and counterparty_v1() in analysis.py.
 alter table rounds add column if not exists rules smallint not null default 1;
 
+-- When each broadcast went out to the pages and when each buy was taken, to the microsecond,
+-- packed by pack_timing() in app.py. Null for rounds logged before it existed. See "Timing" under
+-- "The round log" in the README.
+alter table rounds add column if not exists timing bytea;
+
 
 -- The best-round card. See "The best-round card" in the README.
 

@@ -47,6 +47,10 @@ COLUMNS = [
     "bucket",  # where the ball landed
     "won",  # 1 if this share paid out, 0 if not
     "profit",  # what the share made: 1 - price if it won, -price if not
+    # From the round's timing; empty for rounds logged before it existed (see "Timing" in the README):
+    "taken_ms",  # when the server took the buy, in milliseconds since the drop: "frame", to the microsecond
+    "answer_ms",  # how long after the newest broadcast was written to the player's pages the buy was taken: network both ways plus the player's own reaction
+    "send_delay_ms",  # how long after that broadcast was made it was written to the player: their place in that broadcast's random order
 ]
 
 
@@ -90,6 +94,9 @@ def rounds(db=None):
     - "prices_for": what a share was charged in the round, by the rules it was played by, as a
       function like app.costs_for(): each side's fraction of the shares for version 1, the price
       before the buy for version 2, and the market maker's cost of the buy for version 3.
+    - "timing": the round's timing, as app.unpack_timing() gives it: when each broadcast was made
+      and written to the pages, and for each buy, lined up with "buys", when it was taken and
+      the newest broadcast the buyer had been written by then. None for rounds logged before it.
     """
     db = db or connect()
     for row in fetch(db, "rounds", "id", limit=ROUNDS_PER_REQUEST):
@@ -101,6 +108,7 @@ def rounds(db=None):
         row["states"] = states if app.positions(states) == row["path"] and bucket == row["bucket"] else None
         row["bot_buys"] = bot_buys(row)
         row["prices_for"] = {1: prices_v1, 2: app.prices_for, 3: app.costs_for}[rules(row)]
+        row["timing"] = app.unpack_timing(from_bytea(row["timing"])) if row.get("timing") else None
         yield row
 
 
@@ -182,9 +190,23 @@ def buy_lines(entry, name_by_key):
             *ball(entry, frame), *ball(entry, seen_frame),
             player_shares["left"], player_shares["right"], bot_shares["left"], bot_shares["right"],
             entry["close_frame"], entry["bucket"], int(won), round(won - price, 2),
+            *timing_cells(entry, number),
         ])
         player_shares[side] += 1
     return lines, odd_prices
+
+
+def timing_cells(entry, number):
+    """The taken_ms, answer_ms and send_delay_ms cells for a round's buy number, each empty when
+    the round has no timing or the buyer hadn't been written a broadcast of the round yet."""
+    if entry["timing"] is None:
+        return ["", "", ""]
+    taken, seen, broadcast = entry["timing"]["buys"][number]
+    ms = lambda seconds: round(seconds * 1000, 3)
+    if seen is None or broadcast is None:
+        return [ms(taken), "", ""]
+    built = entry["timing"]["broadcasts"][broadcast][0]
+    return [ms(taken), ms(taken - seen), ms(seen - built)]
 
 
 def main():
@@ -214,7 +236,8 @@ def main():
     for commit_id, count in not_replayed.items():
         print(
             f"{count} rounds played by version {commit_id} didn't replay to the path that was saved, so their "
-            "velocities are empty. The physics has changed since: check out that version to replay them."
+            "velocities are empty. Either the physics has changed since (check out that version to replay them), "
+            "or they were played before start_x was rounded to what the database keeps, and can't be replayed exactly."
         )
     if odd_prices:
         print(
