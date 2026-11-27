@@ -3,7 +3,7 @@ services:
   - type: web
     name: bouncemarket
     runtime: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
     envVars:  # set these in the Render dashboard; "sync: false" keeps their values out of this file

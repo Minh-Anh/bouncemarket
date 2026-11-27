@@ -1,5 +1,5 @@
 # /// script
-# dependencies = ["httpx", "starlette", "uvicorn"]  # the same as app.py, which this imports
+# dependencies = ["httpx==0.28.1", "pillow==12.0.0", "starlette==1.10.0", "uvicorn[standard]==0.54.0"]  # the same as app.py, which this imports
 # ///
 """Read the round log back out of the database, for analysis.
 
@@ -87,7 +87,9 @@ def rounds(db=None):
       the round was played by (its "rules" version): from the path alone for version 1, and
       from the path, start_x and the player buys for version 2, today's Counterparty in app.py.
       They are only right if those rules haven't changed since without a new version.
-    - "prices_for": the pricing the round was played by, as a function like app.prices_for().
+    - "prices_for": what a share was charged in the round, by the rules it was played by, as a
+      function like app.costs_for(): each side's fraction of the shares for version 1, the price
+      before the buy for version 2, and the market maker's cost of the buy for version 3.
     """
     db = db or connect()
     for row in fetch(db, "rounds", "id", limit=ROUNDS_PER_REQUEST):
@@ -98,15 +100,16 @@ def rounds(db=None):
         states, bucket = app.simulate_drop(row["start_x"], row["gravity"], row["bounce"])
         row["states"] = states if app.positions(states) == row["path"] and bucket == row["bucket"] else None
         row["bot_buys"] = bot_buys(row)
-        row["prices_for"] = prices_v1 if rules(row) == 1 else app.prices_for
+        row["prices_for"] = {1: prices_v1, 2: app.prices_for, 3: app.costs_for}[rules(row)]
         yield row
 
 
 def rules(row):
     """Which pricing and counterparty rules a logged round was played by. Rounds logged before
-    the column existed were version 1."""
+    the column existed were version 1. Versions 2 and 3 have the same counterparty; version 3
+    charges each buy the market maker's cost (app.costs_for_net()), not the price before it."""
     version = row.get("rules", 1)
-    if version not in (1, app.RULES_VERSION):
+    if version not in (1, 2, 3) or version > app.RULES_VERSION:
         raise SystemExit(f"round {row['id']} was played by rules version {version}, which this version of app.py doesn't have")
     return version
 

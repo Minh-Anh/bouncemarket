@@ -370,10 +370,12 @@
       // A share can be bought while betting is open, if we can afford its price.
       // Once we hold shares this round, each card also shows what we'd net if the ball lands on
       // its side: every share on that side pays 1, minus everything we paid this round, both sides.
+      // The price shown is what a buy is charged ("costs"), so the two don't quite add up to 1.
       const holding = me.shares.left + me.shares.right > 0;
+      const costs = game.costs || game.prices;  // an older server sends no costs
       for (const buyButton of document.querySelectorAll(".side button")) {
         const side = buyButton.dataset.side;
-        const price = game.prices[side];
+        const price = costs[side];
         document.getElementById("price-" + side).textContent = price.toFixed(2);
         document.getElementById("shares-" + side).textContent = me.shares[side];
         document.getElementById("net-" + side).textContent = holding ? ` · ${signed(me.shares[side] - me.spent)}` : "";
@@ -382,7 +384,7 @@
 
       // Out of points: we can't afford a share on either side and hold none that could win some
       // back. Without a way out, both buy buttons would stay grey for good, so we offer a reset.
-      const broke = !holding && game.prices.left > me.points && game.prices.right > me.points;
+      const broke = !holding && costs.left > me.points && costs.right > me.points;
       document.getElementById("broke-reset").hidden = !broke;
 
       // Market odds. The two prices always add up to 1, so each is the chance the market gives

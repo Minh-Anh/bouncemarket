@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import bisect
+import collections
 import contextlib
 import datetime
 import hmac
@@ -51,8 +52,9 @@ FINAL_STRETCH_FRAMES = 90  # for the last 1.5 seconds before betting closes, and
 EARLY_AHEAD_FRAMES = 48  # before that, send positions this far ahead (0.8 seconds), so a message is needed only every half second
 POSITION_DECIMALS = 1  # ball positions are sent rounded to tenths of a pixel; 0 (whole pixels) is ~15% smaller but may look steppy
 BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the page can play back smoothly
-RULES_VERSION = 2  # saved with each round; change it whenever the pricing or the counterparty changes, so analysis.py replays each round under its own rules
+RULES_VERSION = 3  # saved with each round; change it whenever the pricing or the counterparty changes, so analysis.py replays each round under its own rules
 PRICE_SOFTNESS = 7  # how many more shares one side needs than the other for its price to reach 0.73 (see prices_for()); higher makes each share move the price less
+MAX_BUYS_PER_SECOND = 10  # the most buys one player can make in any one second; a person clicks 5 to 8.5 times a second, a script far faster
 # The counterparty (see Counterparty): a few pretend traders, buying the way a person would.
 COUNTERPARTY_TRADERS = 5  # how many; one alone can't click fast enough to keep up with the ball near the bottom. Each player who buys takes one's place
 COUNTERPARTY_FULL_LEAN = 0.5  # a ball this far from the middle towards a wall counts as fully on its side (see counterparty_guess())
@@ -168,6 +170,10 @@ named_points = {}
 # starts, and added to whenever a player claims a name. Once the whole table has been read,
 # an id that isn't here can't have a row, so get_player() doesn't need to ask the database.
 saved_ids = set()
+
+# When each player made their buys in the last second, {player_id: deque of time.monotonic()},
+# so buy() can turn down a player buying faster than MAX_BUYS_PER_SECOND. Emptied every round.
+recent_buys = {}
 
 # One entry per open page: a queue of messages waiting to be sent to it, and whose page it is.
 streams = {}  # {queue: player_id}
@@ -613,10 +619,55 @@ def prices_for_net(net):
     return {"left": left_price, "right": round(1 - left_price, 2)}
 
 
-def prices(frame=None):
-    """What one share on each side costs at the frame given, or right now if none is."""
+def costs_for(left, right):
+    """What buying the next share on each side is charged, once this many shares have been bought
+    on each side. See costs_for_net()."""
+    return costs_for_net(left - right)
+
+
+def costs_for_net(net):
+    """What buying the next share on each side is charged, when net more shares have been bought
+    on the left than on the right.
+
+    A buy moves the price, so the share is charged the average of the price along that move,
+    not the price before it: the cost a logarithmic market maker charges, PRICE_SOFTNESS * ln(1 - p
+    + p * e^(1 / PRICE_SOFTNESS)) for a side whose price is p. Charging the price before the move
+    gave away half a price step on every share, and made a Left share and then a Right share cost
+    less than the 1 point the pair is sure to pay.
+
+    At this cost, buying both sides gains nothing. Equal shares on both sides bring the price back
+    where it started, so the buys pair off: a Left buy at some net with a Right buy back from one
+    above it. The two exact costs add up to exactly 1, and rounded to the cent they still do, as one
+    is 1 minus the other. So any set of buys that's sure to pay costs exactly what it pays, and
+    rounding to the nearest cent, not up, keeps the house from taking a cut. At 0.50 a side, a
+    share costs 0.52.
+    """
+    left_chance = 1 / (1 + math.exp(-net / PRICE_SOFTNESS))
+    step = math.exp(1 / PRICE_SOFTNESS)
+
+    def cost(chance):
+        exact = PRICE_SOFTNESS * math.log(1 - chance + chance * step)
+        return min(0.99, max(0.01, round(exact, 2)))  # never free, and never a sure loss
+
+    return {"left": cost(left_chance), "right": cost(1 - left_chance)}
+
+
+def market(frame=None):
+    """The shares bought on each side at the frame given, or right now if none is, by players and
+    the counterparty together."""
     theirs = counterparty_shares(frame)
-    return prices_for(game["shares"]["left"] + theirs["left"], game["shares"]["right"] + theirs["right"])
+    return game["shares"]["left"] + theirs["left"], game["shares"]["right"] + theirs["right"]
+
+
+def prices(frame=None):
+    """Each side's price at the frame given, or right now if none is: the chance the market gives
+    it. What a share is charged is costs(), a little more, as buying moves the price."""
+    return prices_for(*market(frame))
+
+
+def costs(frame=None):
+    """What buying the next share on each side is charged at the frame given, or right now if none is."""
+    return costs_for(*market(frame))
 
 
 def sse(event, data):
@@ -658,6 +709,7 @@ def settle():
 
     game["shares"] = {"left": 0, "right": 0}
     game["last_bucket"] = bucket
+    recent_buys.clear()  # nobody can buy between rounds, so nothing in it is still in the last second
     for row in rows:
         named_points[row["name"]] = row["points"]
     for queue, player_id in streams.items():
@@ -1281,6 +1333,7 @@ async def broadcast():
             "dropping": game["dropping"],
             "seconds_to_drop": max(0, game["drops_at"] - time.time()),
             "prices": prices(),
+            "costs": costs(),  # what the buy buttons charge
             "betting_open": betting_open(),
             "online": len(streams),
             "last_bucket": game["last_bucket"],
@@ -1372,7 +1425,7 @@ async def events(request):
 
 
 async def buy(request):
-    """Buy one share on one side, at the current price."""
+    """Buy one share on one side, at its current cost (see costs_for_net())."""
     data = await read_json(request)
     side = data.get("side")
     if side not in ("left", "right"):
@@ -1384,7 +1437,15 @@ async def buy(request):
     frame = current_frame()  # read the clock once, so the logged frame is the one the price was worked out at
     if not betting_open(frame):
         return JSONResponse({"error": "trading is closed."}, status_code=400)
-    price = prices(frame)[side]
+    # At most MAX_BUYS_PER_SECOND in any one second, so a script can't flood the market.
+    now = time.monotonic()
+    times = recent_buys.setdefault(player_id, collections.deque())
+    while times and times[0] <= now - 1:
+        times.popleft()
+    if len(times) >= MAX_BUYS_PER_SECOND:
+        return JSONResponse({"error": "too many buys at once, slow down."}, status_code=429)
+    times.append(now)
+    price = costs(frame)[side]
     if price > player["points"]:
         return JSONResponse({"error": "you don't have enough points."}, status_code=400)
     # For the round log. The page says which frame it was showing when the button was pressed,
