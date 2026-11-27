@@ -221,3 +221,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local copies of the round log and name scans made by the scripts in analyses/
+*.pkl
+names*.json

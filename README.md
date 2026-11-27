@@ -270,6 +270,69 @@ It also says if any rounds didn't replay to the path that was saved, or if any b
 
 To work with whole rounds in Python instead, `analysis.rounds()` gives each one with its path, its exact state at every frame, and its buys.
 
+## What players are doing
+
+A study of the round log on 27 November 2026 (the scripts are in [`analyses/`](analyses/README.md)), of rounds played under `e09f030` (rules version 3), before the timing column, the shuffled send order and the rounding of `start_x`. The market maker figures are from 273 rounds between 17:28 and 18:28 UTC; the rest from 600 rounds between 18:40 and 20:54 UTC, with about 1,250 players and 1,000 to 1,700 buys a round. Those rounds were played before `start_x` was rounded, so only about one in ten replays exactly: the study used the saved `path` for the ball, and the counterparty worked out again from `start_x` is off by a share in about a third of rounds, which barely moves any figure here.
+
+### The market maker loses a fixed amount each round
+
+It lost 1,315 points in the hour, 4.82 a round, and lost 270 of the 273 rounds. Nearly all of that is built into the pricing. A logarithmic market maker's loss over a round depends only on how far ahead the winning side is at the close: nothing if the two are level, and at most `PRICE_SOFTNESS` × ln 2 = 4.85 points once the price is sure of the winner, which it nearly always is by the close. Each round splits exactly into three parts:
+
+| Part | Points in the hour | A round |
+| ---- | ------------------ | ------- |
+| The pricing's built-in loss | −1,267 | −4.64 |
+| Rounding to the cent, and the 0.01 and 0.99 limits | −43 | −0.16 |
+| The counterparty's shares (it neither pays for them nor collects on them) | −5 | −0.02 |
+
+So the house gives away about 4.8 points every round anyone trades: about 1,300 points an hour into players' balances at this pace, 0.7% of the points that change hands. It is left that way on purpose. A fee of a cent a share would turn it round, and a lower `PRICE_SOFTNESS` shrinks it in proportion, at the cost of each share moving the price more.
+
+### The crowd misprices the round, in a way that can be predicted
+
+Early in a drop the crowd piles onto whichever side the ball is on, though high up that says little: the board is chaotic. Late in a drop the price is slow to believe what is plain. The favourite's price, sampled every 6 frames, against how often the favourite won:
+
+| Price | First third of the betting window | Middle third | Last third |
+| ----- | --------------------------------- | ------------ | ---------- |
+| about 0.74 | won 0.60 | 0.70 | 0.81 |
+| about 0.84 | 0.59 | 0.80 | 0.94 |
+| 0.95 to 0.99 | 0.76 | 0.98 | 1.00 |
+
+Taken over all buys, shares bought at 0.10 to 0.40 made 0.09 to 0.13 each and shares bought at 0.60 to 0.90 lost about as much.
+
+### The kinds of trader
+
+**A speed trader (foob).** By far the biggest winner: +3,049 points over the 600 rounds, 5.08 a round, about the whole of what the market maker gives away. foob buys the underdog early (+1,029) and in the middle (+888), and the near-certain favourite late, in volume at small margins (+336 from 11,493 buys). It buys both sides in 96% of rounds, but isn't hedging: its worst case averages −22 a round. It makes money at every price, and the price of its side rises about 0.11 in the second after it buys. It is almost certainly a script: up to 10 buys in one frame (exactly `MAX_BUYS_PER_SECOND`, all at once), and about 50 a round.
+
+Its edge is a race. Each buy was valued again as if it had come d frames later, at the price the market had reached by then, leaving out foob's own later buys:
+
+| Delay | 0 | 1 frame (17 ms) | 2 | 3 (50 ms) | 6 (100 ms) | 12 (200 ms) | 30 (0.5 s) | 60 (1 s) |
+| ----- | - | --------------- | - | --------- | ---------- | ----------- | ---------- | -------- |
+| Profit a share | +0.120 | +0.104 | +0.079 | +0.061 | +0.042 | +0.018 | +0.066 | +0.049 |
+
+Half of it is gone in 50 ms and 85% in 200 ms. Some comes back after half a second, as the crowd that rushed in behind overshoots and the price falls back: that slower part is the mispricing above.
+
+foob is also first to the server. At the start of a drop, when every page hears of it from the same broadcast, foob's first buy arrived before any other player's in 63% of rounds, typically at frame 5 and never at frame 0 (so it answers the broadcast; it doesn't time its request from the countdown), 33 to 100 ms ahead of the next fastest (switcharoo-alpha, kitsu_test, clawde). In a tenth of rounds its whole loop, from the broadcast to its buy arriving, took about 50 ms or less. Without the timing log, its network, its code and its place in the old fixed send order (the order pages connected) can't be told apart; the timing log and the shuffled order were added to settle that (see [Timing](#timing)).
+
+**A pack that follows within 200 ms.** In the 200 ms after one of foob's bursts, other players bought 137,615 shares on its side and 86,635 on the other. The fastest followers nearly always take its side: doober (84%), goober (85%), hydrogen (88%), prrrrrrrrrrrrr (91%), clawde (77%), martin (92%), Zone (100%), tokenmaxer_bot (98%), Precogbot (96%). For doober, hydrogen and prrrrrrrrrrrrr these are 40 to 50% of all they buy. The log can't tell whether they react to the same signal a moment later or chase foob's move on the price.
+
+**Slow-edge traders (martin, tokenmaxer_bot).** martin made +1,334 points (98.7% of shares won, at an average price of 0.92), tokenmaxer_bot +337. Their edge doesn't decay with delay; it grows (martin +0.081 a share at once, +0.112 a second later), as they tend to buy just after foob's bursts, at the top of the move, and then the price falls back. They win by being right, not by being fast.
+
+**Traders reading the buffered frames, a little.** Early in a drop the stream carries positions 48 frames (0.8 s) ahead of the server's frame, and a normal page runs about 12 behind it, so a script reading the stream itself sees the ball's near future. To look for that, a model of the chance of landing left from the ball's position and sideways speed (a grid, learned on half the rounds and tested on the other half) gave the change in chance for the side bought over three steps: from what a page shows to the server's frame, from there to the newest frame sent, and, as a control, from there to frames not yet sent to anyone. Leaning towards the last can only be forecasting; leaning more towards the frames sent than towards the control is a sign of reading them. The model does predict better from the frames sent than from the server's frame.
+
+| Player | Page → server | Server → newest sent | Newest sent → not yet sent (control) | Lean on the frames sent, beyond the control |
+| ------ | ------------- | -------------------- | ------------------------------------ | -------------------------------------------- |
+| Zone | 53.1% | 59.1% | 55.6% | +3.5 |
+| Precogbot | 54.3% | 58.1% | 55.0% | +3.1 |
+| martin | 53.5% | 58.0% | 55.0% | +3.0 |
+| doober | 52.4% | 55.7% | 53.5% | +2.2 |
+| tokenmaxer_bot | 54.2% | 58.2% | 56.8% | +1.4 |
+| foob | 52.6% | 54.2% | 54.2% | 0.0 |
+| prrrrrrrrrrrrr | 56.2% | 54.3% | 58.9% | −4.6 |
+| everyone else | 49.5% | 49.3% | 49.5% | |
+
+Zone, Precogbot and martin lean about 3 points more towards the frames they've been sent than towards ones nobody has, which fits reading the stream, but most of their lean is forecasting, and with buys coming in bursts a gap that size could be noise. foob shows none of it: it is fast, not peeking. prrrrrrrrrrrrr is the odd one, better at frames not yet sent than at ones it has, which fits running the physics forward. The lookahead was kept at 48 frames: trading on the buffered frames is part of the game. Comparing the excess early in a drop (48 frames ahead) with the final stretch (12 ahead) would show more.
+
+**Everyone else** (all but foob, martin and tokenmaxer_bot) loses slowly: −842 points over 626,319 buys in the 600 rounds, about −0.001 a share, mostly buying the side the ball is on (55% of buys), with no edge at any delay.
+
 ## Tuning the physics
 
 Gravity and bounce can be passed on the command line:
