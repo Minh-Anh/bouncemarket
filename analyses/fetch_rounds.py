@@ -27,7 +27,7 @@ rows = rows[:n][::-1]
 for row in rows:
     row["path"] = app.unpack_path(analysis.from_bytea(row["path"]))
     row["buys"] = app.unpack_buys(analysis.from_bytea(row["buys"]))
-    states, bucket = app.simulate_drop(row["start_x"], row["gravity"], row["bounce"])
+    states, bucket = app.replay_drop(row)
     row["states"] = states if app.positions(states) == row["path"] and bucket == row["bucket"] else None
     row["bot_buys"] = analysis.bot_buys(row)
     row["timing"] = app.unpack_timing(analysis.from_bytea(row["timing"])) if row.get("timing") else None

@@ -1,8 +1,9 @@
 # /// script
 # dependencies = ["httpx==0.28.1", "pillow==12.0.0", "starlette==1.10.0", "uvicorn[standard]==0.54.0"]
 # ///
-"""End-to-end test of the timing log, the shuffled send order and the start_x rounding, with the
-real app served by uvicorn in this process and a fake database (nothing reaches Supabase)."""
+"""End-to-end test of the timing log, the shuffled send order, the start_x rounding and the hidden
+nudges, with the real app served by uvicorn in this process and a fake database (nothing reaches
+Supabase)."""
 import asyncio
 import json
 import os
@@ -25,7 +26,8 @@ import app
 saved_rounds = []
 # Without --timing-column, the fake database starts without the timing column, to test that
 # rounds are still saved (without their timing). With it, rounds are saved with their timing.
-mode = {"timing_column": "--timing-column" in sys.argv}
+# With --no-nudge-columns, it is also without the nudge columns.
+mode = {"timing_column": "--timing-column" in sys.argv, "nudge_columns": "--no-nudge-columns" not in sys.argv}
 next_key = [1]
 
 
@@ -42,8 +44,12 @@ def fake_db(request: httpx.Request):
         return httpx.Response(201, json=out)
     if path.endswith("/rounds"):
         rows = json.loads(request.content)
+        if len({tuple(sorted(row)) for row in rows}) > 1:  # as PostgREST: every row sent at once has the same keys
+            return httpx.Response(400, json={"code": "PGRST102", "message": "All object keys must match"})
         if not mode["timing_column"] and any("timing" in row for row in rows):
             return httpx.Response(400, json={"code": "PGRST204", "message": "Could not find the 'timing' column of 'rounds' in the schema cache"})
+        if not mode["nudge_columns"] and any("nudge_seed" in row for row in rows):
+            return httpx.Response(400, json={"code": "PGRST204", "message": "Could not find the 'nudge_seed' column of 'rounds' in the schema cache"})
         saved_rounds.extend(rows)
         return httpx.Response(201, json=[])
     return httpx.Response(201, json=[])
@@ -107,8 +113,16 @@ async def main():
         while not app.game["dropping"] or not app.game["buys"]:
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.5)
-        json.dumps(app.handover_snapshot())
+        snapshot = json.loads(json.dumps(app.handover_snapshot()))
         results["snapshot_ok"] = True
+        assert app.game["nudge_seed"] is not None and app.game["nudge"] == app.NUDGE
+        # Nothing a page is sent while the ball falls carries the seed.
+        assert str(app.game["nudge_seed"]) not in app.catch_up() + app.parting_message(), "the seed reached a page"
+        # A server from before the nudges hands over its round in flight, and a round log, without nudge keys.
+        old = json.loads(json.dumps(snapshot))
+        for key in ("nudge", "nudge_seed"):
+            old["game"].pop(key)
+        old["from"] = "old-server"
         # wait for two rounds to be logged and saved (the first save hits the missing column)
         for _ in range(400):
             if len(saved_rounds) >= 2 and len(made_logs) >= 2:
@@ -127,8 +141,30 @@ async def main():
     server.should_exit = True
     await serve
 
-    print("saved rounds:", len(saved_rounds), "| timing_column flag now:", app.timing_column,
-          "| saved with timing:", sum("timing" in r for r in saved_rounds))
+    missing_seen = sorted(app.missing_round_columns) or "none"  # before the batch check below clears them
+    # Take the old server's round over: it carries on without nudges, and its round log saves in
+    # one batch with a round of ours, which has them.
+    for task in app.game_tasks:
+        task.cancel()
+    app.game_tasks.clear()
+    app.set_role("waiting")
+    app.take_over(old)
+    assert app.game["nudge"] == 0.0 and app.game["nudge_seed"] is None and app.game["path"] == old["game"]["path"]
+    for task in app.game_tasks:
+        task.cancel()
+    print("a round handed over from a server without nudges carries on without them")
+    old_log = {key: value for key, value in made_logs[0].items() if key not in ("nudge", "nudge_seed")}
+    if True:
+        before = len(saved_rounds)
+        mode.update(timing_column=True, nudge_columns=True)
+        app.missing_round_columns.clear()
+        app.unsaved_rounds[:] = [{**old_log, "started_at": "2000-01-01T00:00:00+00:00"}, made_logs[-1]]
+        await app.save_rounds()
+        assert len(saved_rounds) == before + 2 and saved_rounds[-2]["nudge_seed"] is None and saved_rounds[-2]["nudge"] == 0.0
+        print("a batch mixing rounds with and without nudges saves")
+
+    print("saved rounds:", len(saved_rounds), "| columns found missing:", missing_seen,
+          "| saved with timing:", sum("timing" in r for r in saved_rounds), "| with nudge seed:", sum("nudge_seed" in r for r in saved_rounds))
     print("handover snapshot JSON-serialisable:", results["snapshot_ok"])
     print("distinct send orders across", len(by_broadcast), "broadcasts with all pages:", len(results["shuffle_orders"]))
 
@@ -150,9 +186,14 @@ async def main():
         # start_x: 15 digits, round-trips through a 15-digit print, and replays to the same path
         sx = log["start_x"]
         assert float(f"{sx:.15g}") == sx, sx
-        states, bucket = app.simulate_drop(sx, log["gravity"], log["bounce"])
-        assert app.positions(states) == app.unpack_path(bytes.fromhex(log["path"][2:])) and bucket == log["bucket"]
-        print("start_x", repr(sx), "round-trips through 15 digits and replays exactly")
+        path = app.unpack_path(bytes.fromhex(log["path"][2:]))
+        states, bucket = app.replay_drop(log)
+        assert app.positions(states) == path and bucket == log["bucket"]
+        print("start_x", repr(sx), "round-trips through 15 digits and replays exactly, with nudge seed", log["nudge_seed"])
+        # Without its seed, the drop is a different one: the nudges are really there.
+        plain, _ = app.simulate_drop(sx, log["gravity"], log["bounce"])
+        assert app.positions(plain) != path, "the drop without nudges is the same"
+    assert len({log["nudge_seed"] for log in logs}) == len(logs), "two rounds had the same seed"
     # Save-format check: what was written to the fake database unpacks
     with_timing = [r for r in saved_rounds if "timing" in r and r["timing"]]
     for r in with_timing:

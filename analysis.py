@@ -9,9 +9,9 @@ writes one line per buy that any player has ever made, with the state of the gam
 moment: where the ball was and how fast it was moving, what had been bought on each side,
 the price, and how the round came out. End the file name in .gz to have it compressed.
 
-Only where the ball dropped from is needed to know its state at every frame: the round is
-played again here from that one number, by the same simulate_drop() the server uses, and
-checked against the path the server saved. To work with the rounds directly, in Python:
+Only where the ball dropped from, and the seed of its hidden nudges, are needed to know its
+state at every frame: the round is played again here from those, by the same simulate_drop()
+the server uses, and checked against the path the server saved. To work with the rounds directly, in Python:
 
     import analysis
     for entry in analysis.rounds():
@@ -104,7 +104,7 @@ def rounds(db=None):
             raise SystemExit(f"round {row['id']} was packed as format {row['format']}, which this version of app.py can't unpack")
         row["path"] = app.unpack_path(from_bytea(row["path"]))
         row["buys"] = app.unpack_buys(from_bytea(row["buys"]))
-        states, bucket = app.simulate_drop(row["start_x"], row["gravity"], row["bounce"])
+        states, bucket = app.replay_drop(row)
         row["states"] = states if app.positions(states) == row["path"] and bucket == row["bucket"] else None
         row["bot_buys"] = bot_buys(row)
         row["prices_for"] = {1: prices_v1, 2: app.prices_for, 3: costs_v3, 4: app.costs_for}[rules(row)]

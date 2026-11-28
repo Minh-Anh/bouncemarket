@@ -41,9 +41,10 @@ LAST_ROW_Y = FIRST_ROW_Y + (ROWS - 1) * ROW_GAP
 WALL_SLANT = 60
 WALL_LENGTH = math.sqrt(WALL_SLANT**2 + HEIGHT**2)
 
-# Physics. Gravity and bounce can be set on the command line, e.g. --bounce 0.3 (see the bottom of the file).
+# Physics. Gravity, bounce and the nudge can be set on the command line, e.g. --bounce 0.3 (see the bottom of the file).
 GRAVITY = 400.0  # pixels / second^2
 BOUNCE = 0.85  # fraction of speed kept after hitting something, 0 to 1
+NUDGE = 0.003  # the typical size, in radians (0.17 degrees), of the hidden random turn the ball takes at each pin bounce; 0 for none (see simulate_drop())
 DT = 1 / 240  # seconds per physics step
 STEPS_PER_FRAME = 4  # the page is sent one ball position per frame
 FRAME_SECONDS = STEPS_PER_FRAME * DT  # 1/60 second
@@ -200,6 +201,10 @@ game = {
     "commit": COMMIT,
     "gravity": GRAVITY,
     "bounce": BOUNCE,
+    "nudge": NUDGE,
+    # The seed of this drop's hidden nudges (see simulate_drop()). It must never reach a page
+    # while the ball is falling: it is saved with the round, and on the card, once it has landed.
+    "nudge_seed": None,
     "counterparty": None,  # the counterparty for this drop, a Counterparty, which keeps its own buys
     "sent_frames": 0,  # how many frames of the path have been sent to the pages so far
     "shares": {"left": 0, "right": 0},  # all the shares players have bought this round, added up
@@ -267,9 +272,11 @@ player_keys = {}
 
 # Rounds waiting to be saved to the round log, oldest first, each as made by round_log().
 unsaved_rounds = []
-# Whether the rounds table has its timing column, as far as we know: save_rounds() stops
-# sending the timing if the database says it doesn't (schema.sql not run since it was added).
-timing_column = True
+# Columns added to the rounds table after it was first made, each with the round log's keys
+# that go in it, and those the database has told us it doesn't have (schema.sql not run since
+# they were added). save_rounds() stops sending those, until the server restarts.
+LATER_ROUND_COLUMNS = {"timing": ("timing",), "nudge": ("nudge", "nudge_seed"), "nudge_seed": ("nudge", "nudge_seed")}
+missing_round_columns = set()
 
 # The best-round card. Each player's best round so far, {player_id: record}, for the players
 # whose best we know, each record as made by new_best_rounds(). Only a round that made more
@@ -301,16 +308,31 @@ saving_players = asyncio.Lock()
 saving_cards = asyncio.Lock()
 
 
-def simulate_drop(start_x, gravity, bounce):
+def simulate_drop(start_x, gravity, bounce, nudge=0.0, nudge_seed=None):
     """Drop one ball from start_x along the top. Returns its state at every frame, as
     [(x, y, vx, vy)] (position and velocity), and the bucket it lands in.
 
-    The same start_x, gravity and bounce always give exactly the same drop, on any computer.
-    The sums use only + - * / and square roots, which every computer rounds the same way
-    (math.hypot, for one, is not promised to). That matters because the path is chaotic: the
-    tiniest difference early on lands the ball in the other bucket. It is what lets the round
-    log save one number for a drop and analysis.py replay it later, velocities included.
+    At each pin bounce the ball's direction is turned by a small random angle, typically nudge
+    radians either way, drawn from a generator seeded with nudge_seed. The seed is a secret
+    until the round is over. Without the nudges, the whole drop follows from where the ball
+    starts, and players worked that out from the path the pages are sent: by about halfway down,
+    a script could know the winner for certain (see "The hidden nudges" in the README). The
+    path is chaotic, so even this small a turn, too small to see, soon makes the rest of the
+    drop impossible to work out from what has been seen of it. With no seed, or a nudge of 0,
+    there are no turns, as in every drop played before they were added.
+
+    The same start_x, gravity, bounce, nudge and nudge_seed always give exactly the same drop,
+    on any computer. The sums use only + - * / and square roots, which every computer rounds
+    the same way (math.hypot, for one, is not promised to, nor are math.cos and math.sin, so the
+    turn is made without them). The generator's random() is promised to give the same numbers
+    from the same seed in every version of Python. That matters because the path is chaotic:
+    the tiniest difference early on lands the ball in the other bucket. It is what lets the
+    round log save a few numbers for a drop and analysis.py replay it later, velocities included.
     """
+    turns = random.Random(nudge_seed) if nudge and nudge_seed is not None else None
+    # Each turn is by 2 * atan(t), for t drawn evenly from -reach to reach: about 2t, as t is
+    # small, so the angle is spread evenly over twice that and its standard deviation is nudge.
+    reach = nudge * math.sqrt(3) / 2
     x, y = start_x, 0.0
     vx, vy = 0.0, 0.0
     states = []
@@ -357,9 +379,23 @@ def simulate_drop(start_x, gravity, bounce):
                 if speed_into_pin > 0:
                     vx += (1 + bounce) * speed_into_pin * nx
                     vy += (1 + bounce) * speed_into_pin * ny
+                    if turns:
+                        # Turn (vx, vy) by the angle whose half has tangent t, which keeps the
+                        # speed the same: cos and sin of that angle, from t alone.
+                        t = (2 * turns.random() - 1) * reach
+                        cos, sin = (1 - t * t) / (1 + t * t), 2 * t / (1 + t * t)
+                        vx, vy = vx * cos - vy * sin, vx * sin + vy * cos
 
     bucket = "left" if x < WIDTH / 2 else "right"
     return states, bucket
+
+
+def replay_drop(numbers):
+    """simulate_drop() for a drop already played, from the numbers it was saved with: a round
+    in the round log, or a card's trajectory. Drops played before the nudges have none saved,
+    and replay without them, as they were played."""
+    return simulate_drop(numbers["start_x"], numbers["gravity"], numbers["bounce"],
+                         numbers.get("nudge") or 0.0, numbers.get("nudge_seed"))
 
 
 def positions(states):
@@ -989,6 +1025,8 @@ def round_log():
         "gravity": game["gravity"],
         "bounce": game["bounce"],
         "start_x": game["start_x"],
+        "nudge": game["nudge"],
+        "nudge_seed": game["nudge_seed"],
         "frames": len(game["path"]),
         "close_frame": game["close_frame"],
         "bucket": game["bucket"],
@@ -1024,14 +1062,17 @@ async def save_rounds():
         for row in response.json():
             player_keys[row["id"]] = row["key"]
 
-    global timing_column
     rows = []
     for log in logs:
         buys = [(frame, seen, player_keys[player_id], *rest) for frame, seen, player_id, *rest in log["buys"]]
-        row = {**log, "n_buys": len(buys), "buys": to_bytea(pack_buys(buys))}
-        if not timing_column:
-            row.pop("timing", None)
+        # A round handed over by a server from before the nudges has no nudge keys. The database
+        # wants every row it is sent at once to have the same keys, so they are filled in: it
+        # was played without nudges.
+        row = {"nudge": 0.0, "nudge_seed": None, **log, "n_buys": len(buys), "buys": to_bytea(pack_buys(buys))}
         rows.append(row)
+
+    def without_missing(rows):
+        return [{key: value for key, value in row.items() if key not in missing_round_columns} for row in rows]
 
     async def write(rows):
         return await db.post(
@@ -1041,13 +1082,18 @@ async def save_rounds():
             headers={"Prefer": "resolution=ignore-duplicates"},
         )
 
-    response = await write(rows)
-    # PGRST204: a column the database doesn't have. The rounds are saved without their timing
-    # rather than not at all, until the server restarts after schema.sql has been run.
-    if response.status_code == 400 and timing_column and "PGRST204" in response.text and "timing" in response.text:
-        timing_column = False
-        print("The rounds table has no timing column: run schema.sql. Saving rounds without their timing until then.")
-        response = await write([{key: value for key, value in row.items() if key != "timing"} for row in rows])
+    response = await write(without_missing(rows))
+    # PGRST204: a column the database doesn't have. The rounds are saved without it rather than
+    # not at all, until the server restarts after schema.sql has been run. A round saved without
+    # its nudges can't be replayed exactly, and analysis.py falls back on its saved path.
+    while response.status_code == 400 and "PGRST204" in response.text:
+        named = re.search(r"'(\w+)' column", response.text)
+        keys = LATER_ROUND_COLUMNS.get(named.group(1)) if named else None
+        if not keys or set(keys) <= missing_round_columns:
+            break  # not a column we can do without: raise_for_status() below says what it was
+        missing_round_columns.update(keys)
+        print(f"The rounds table has no {named.group(1)} column: run schema.sql. Saving rounds without {', '.join(keys)} until then.")
+        response = await write(without_missing(rows))
     response.raise_for_status()
     saved = {log["started_at"] for log in logs}
     unsaved_rounds[:] = [log for log in unsaved_rounds if log["started_at"] not in saved]
@@ -1152,7 +1198,8 @@ def new_best_rounds():
             "payout": payout,
             "profit": profit,
             # The ball's whole path follows from these, so a replay can play it again (see simulate_drop()).
-            "trajectory": {"start_x": game["start_x"], "gravity": game["gravity"], "bounce": game["bounce"], "commit_id": game["commit"]},
+            "trajectory": {"start_x": game["start_x"], "gravity": game["gravity"], "bounce": game["bounce"],
+                           "nudge": game["nudge"], "nudge_seed": game["nudge_seed"], "commit_id": game["commit"]},
             "cleared": False,  # True once the player deletes it from their page (see clear_card())
         }
         best_rounds[player_id] = record
@@ -1409,10 +1456,11 @@ async def share_replay(request):
     """The ball's path for a card's round, /r/<share_id>/replay, as {"path": [[x, y], ...]}, one
     position a frame, for the replay on the share page.
 
-    It isn't stored: the record keeps the start_x, gravity and bounce the whole path follows from,
-    and the drop is played again here (see simulate_drop()), which takes a few hundredths of a
-    second. If the physics has changed since, so that the drop no longer lasts as long or lands
-    on the same side, the answer is 404 and the share page shows the card without a replay.
+    It isn't stored: the record keeps the start_x, gravity, bounce, nudge and nudge_seed the
+    whole path follows from, and the drop is played again here (see replay_drop()), which takes
+    a few hundredths of a second. If the physics has changed since, so that the drop no longer
+    lasts as long or lands on the same side, the answer is 404 and the share page shows the card
+    without a replay.
     """
     share_id = request.path_params["share_id"]
     if share_id not in shared_paths:
@@ -1423,8 +1471,7 @@ async def share_replay(request):
             return JSONResponse({"error": "try again in a minute."}, status_code=503)
         if record is None:
             return JSONResponse({"error": "no such round."}, status_code=404)
-        seed = record["trajectory"]
-        states, bucket = simulate_drop(seed["start_x"], seed["gravity"], seed["bounce"])
+        states, bucket = replay_drop(record["trajectory"])
         if bucket != record["outcome"] or len(states) != record["frames"]:
             return JSONResponse({"error": "this round can't be replayed."}, status_code=404)
         remember(shared_paths, share_id, positions(states), PATHS_KEPT)
@@ -1449,7 +1496,10 @@ async def run_rounds():
             # the 15 the round log holds would part from the real drop a few hundred frames in.
             # Any number of 15 digits does come back exactly, so this is the drop that was played.
             start_x = float(f"{drop_random.uniform(WIDTH / 6, WIDTH * 5 / 6):.15g}")
-            states, bucket = simulate_drop(start_x, GRAVITY, BOUNCE)
+            # 63 bits, so it fits the database's bigint. Nobody could try that many seeds against
+            # the path in the few seconds a drop lasts.
+            nudge_seed = drop_random.getrandbits(63)
+            states, bucket = simulate_drop(start_x, GRAVITY, BOUNCE, NUDGE, nudge_seed)
             path = positions(states)
             last_row_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
             # Pages see BUFFER_FRAMES ahead, so betting closes that long before the ball
@@ -1465,6 +1515,8 @@ async def run_rounds():
                 commit=COMMIT,
                 gravity=GRAVITY,
                 bounce=BOUNCE,
+                nudge=NUDGE,
+                nudge_seed=nudge_seed,
                 counterparty=Counterparty(path, close_frame, start_x),
                 sent_frames=0,
                 buys=[],
@@ -2214,8 +2266,11 @@ watching = None  # the task watching for a new server to start taking requests, 
 # What is handed over of the round being played, or of the wait for the next one.
 ROUND_KEYS = (
     "dropping", "drops_at", "started_at", "start_x", "path", "bucket", "close_frame",
-    "commit", "gravity", "bounce", "sent_frames", "shares", "buys", "broadcasts", "buy_timing", "last_bucket",
+    "commit", "gravity", "bounce", "nudge", "nudge_seed", "sent_frames", "shares", "buys", "broadcasts", "buy_timing", "last_bucket",
 )
+# What a round handed over by a server from before these keys existed had instead: its drops
+# were played without nudges.
+ROUND_KEYS_BEFORE = {"nudge": 0.0, "nudge_seed": None}
 
 
 def set_role(role):
@@ -2568,7 +2623,7 @@ def take_over(handed):
         named_points.clear()
         named_points.update(handed["named_points"])
     if carry_on:
-        game.update({key: theirs[key] for key in ROUND_KEYS})
+        game.update({key: theirs[key] if key in theirs else ROUND_KEYS_BEFORE[key] for key in ROUND_KEYS})
         game["counterparty"] = Counterparty(game["path"], game["close_frame"], game["start_x"])
     else:
         game["last_bucket"] = theirs["last_bucket"]
@@ -2645,8 +2700,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gravity", type=float, default=GRAVITY, help="pixels / second^2")
     parser.add_argument("--bounce", type=float, default=BOUNCE, help="fraction of speed kept after hitting something, 0 to 1")
+    parser.add_argument("--nudge", type=float, default=NUDGE, help="typical hidden turn at each pin bounce, in radians; 0 for none")
     args = parser.parse_args()
-    GRAVITY, BOUNCE = args.gravity, args.bounce
+    GRAVITY, BOUNCE, NUDGE = args.gravity, args.bounce, args.nudge
     # uvicorn runs everything on one thread, switching between pages whenever one is waiting,
     # so thousands of open pages are cheap. Render tells us the port through the PORT variable.
     # The short shutdown timeout lets Ctrl-C work while pages still have streams open.

@@ -13,7 +13,7 @@ import app
 rows = pickle.load(open(sys.argv[1], "rb"))["rows"]
 c = collections.Counter(); firstdiff = []
 for r in rows[-60:]:
-    states, bucket = app.simulate_drop(r["start_x"], r["gravity"], r["bounce"])
+    states, bucket = app.replay_drop(r)
     pos = app.positions(states)
     ok = pos == r["path"] and bucket == r["bucket"]
     c[(ok, bucket == r["bucket"], len(pos) == len(r["path"]))] += 1

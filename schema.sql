@@ -63,6 +63,13 @@ alter table rounds add column if not exists rules smallint not null default 1;
 -- "The round log" in the README.
 alter table rounds add column if not exists timing bytea;
 
+-- The hidden random turns the ball takes at each pin bounce (see simulate_drop() in app.py): how
+-- big they typically are, in radians, and the seed they were drawn from, kept secret until the
+-- round was over. With start_x, they give the whole path. Null for rounds played before them,
+-- which had no turns.
+alter table rounds add column if not exists nudge double precision;
+alter table rounds add column if not exists nudge_seed bigint;
+
 
 -- The best-round card. See "The best-round card" in the README.
 
@@ -83,7 +90,7 @@ create table if not exists best_rounds (
   cost numeric not null,  -- everything the player paid this round, both sides
   payout numeric not null,  -- 1 for each share on the side the ball landed on
   profit numeric not null,  -- payout minus cost
-  trajectory jsonb not null  -- what the ball's path follows from: {"start_x", "gravity", "bounce", "commit_id"}
+  trajectory jsonb not null  -- what the ball's path follows from: {"start_x", "gravity", "bounce", "nudge", "nudge_seed", "commit_id"} (no nudges before they were added)
 );
 
 -- Whether the player has deleted this card from their page. A cleared row no longer counts as

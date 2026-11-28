@@ -116,15 +116,25 @@ Players without a name live only in the server's memory. An update carries them 
 
 The database is asked about a player only when it can't already know the answer. The read at startup gives the server the id of every player with a row, and it adds to that list as players claim names. So once that read has worked, a browser id that isn't on the list is a new visitor with nothing saved, and their page starts without the database being asked anything: a big crowd arriving at once costs the database nothing. A player who does have a row is looked up the first time they connect after a restart, for their name, points and lock, and not again until the next restart. Until the startup read has worked (in the first moment after a restart, or while the database is down, when it is tried again every 30 seconds) the server can't tell newcomers from returning players, so it looks up every player as they connect. Claiming a first name also looks the player up once more just before writing the row, in case the row was written moments ago by the previous server, which keeps running for a little while during a deploy; otherwise the new row would overwrite it.
 
+### The hidden nudges
+
+At every pin bounce the ball's direction is turned by a tiny random angle, typically 0.17 degrees either way (`NUDGE` in `app.py`, 0.003 radians), far too small to see. The angles come from a seed the server draws for each drop from the operating system's randomness, and the seed is kept secret until the ball has landed: no page is ever sent it while betting is open. Once the round is over it is saved with the round and on any card made from it, so the drop can still be replayed exactly.
+
+Without the nudges, the whole drop followed from where the ball started. Players worked that out from the path they were sent, as Precogbot had tried across rounds (see [An attempt on the random numbers](#an-attempt-on-the-random-numbers)), only now within one round. As `start_x` is rounded to 15 significant digits, only so many starting points are possible, and a few hundred frames of path leave one: in 200 rounds on 27–28 November 2026 that took a median of 264 frames, with half the betting window still to go. From there a script knew the winner for certain. In about half of the rounds, the price had settled at 0.90 or more on the winner within a frame or so of the stream delivering the frame that settled it, a median of 34 frames before the server's own frame got there, and never once after. Several players (socramt, prrrrrrrrrrrrr, le-botty, garethgeorge, cubebot-v3, foob) won every share they bought in that gap, and they read the stream up to the newest frame sent, 48 frames ahead. Sending whole pixels instead of tenths would only have put the solve 12 frames or so later.
+
+The path is chaotic, so a turn this small soon makes the rest of the drop impossible to work out from what has been seen of it. In 60 drops made with the nudges, even a script that knew the ball's exact position and velocity at every moment (more than the stream gives) could be 95% sure of the winner only a median of 46 frames before betting closed, against the whole drop without them. By then the stream is only 12 frames ahead, so 17% of the betting window is left once it carries the frame that decides it, against half before. In a first test, with the turns drawn a little differently, bigger turns gained little more (1.7 degrees gave 38 frames) and smaller ones gave back a lot (0.00006 degrees gave 132).
+
+The turn is made with the same + − × ÷ and square roots as the rest of `simulate_drop()`, and drawn from a generator whose numbers Python promises not to change, so a replay comes out the same on any computer. Rounds played before the nudges have no seed, and replay without them, as they were played. A round handed over during an update by a server from before them carries on without them too.
+
 ### The best-round card
 
 After each round settles, `new_best_rounds()` in `app.py` works out each buyer's profit from the buys the server itself took, at the frame and price it charged. No route accepts a card, a profit or a trade from a page, so nothing a page sends can make or change one. A round that made more than `CARD_MIN_PROFIT` (1.00) and more than the player's best so far becomes a record, which is sent to that player's open pages as a "card" message (marked fresh) and saved a moment later to the `best_rounds` table by a separate task, like the round log. Pages that connect later are sent the player's card, not fresh.
 
-Each record holds a short random `share_id` (8 characters, the only thing in the link), the player's id and their name at the time, the round's start and settle times, where the ball landed, the player's buys, the left side's price at every frame it changed (cut down to 200 points in a very busy round; the right side's price is always 1 minus it), the cost, payout and profit, and the `start_x`, `gravity`, `bounce` and commit the ball's whole path follows from, for a replay later. Rows are never changed when a better round comes along, so old links keep working, and a player's best is their row with the most profit that they haven't deleted. Deleting a card (`POST /card/clear`, from the card's trash can) sets `cleared` on all the player's rows rather than removing them, so their share links still work. The player's id is never sent to a page or shown on a share page.
+Each record holds a short random `share_id` (8 characters, the only thing in the link), the player's id and their name at the time, the round's start and settle times, where the ball landed, the player's buys, the left side's price at every frame it changed (cut down to 200 points in a very busy round; the right side's price is always 1 minus it), the cost, payout and profit, and the `start_x`, `gravity`, `bounce`, `nudge`, `nudge_seed` and commit the ball's whole path follows from, for a replay later. Rows are never changed when a better round comes along, so old links keep working, and a player's best is their row with the most profit that they haven't deleted. Deleting a card (`POST /card/clear`, from the card's trash can) sets `cleared` on all the player's rows rather than removing them, so their share links still work. The player's id is never sent to a page or shown on a share page.
 
 The card is drawn by `card.js` (styles in `card.css`), on the game page and on the share page `/r/<share_id>` (`share.html`, filled in by `share_page()`). Its preview tags, and the share menu's "copy image", use `/r/<share_id>.png`, a 1200 by 630 picture of the card drawn by `card_image.py` with Pillow, in a thread so the game doesn't wait, and kept in memory once drawn. The address on the picture is `SITE` in `app.py`, not the address a request came in at, as one picture is kept for everyone. A card not saved yet is still found, as share pages look at the unsaved ones first.
 
-The replay (`replay.js`) gets the ball's path from `/r/<share_id>/replay`. The path isn't stored: the server plays the drop again from the record's `start_x`, `gravity` and `bounce` (a few hundredths of a second) and keeps the last 100 in memory. If the physics in `app.py` has changed since, so the drop no longer lasts as long or lands on the same side, that answers 404 and the page shows the card without a replay. The board is drawn by `board.js`, which the game page uses too.
+The replay (`replay.js`) gets the ball's path from `/r/<share_id>/replay`. The path isn't stored: the server plays the drop again from the record's `start_x`, `gravity`, `bounce`, `nudge` and `nudge_seed` (a few hundredths of a second) and keeps the last 100 in memory. If the physics in `app.py` has changed since, so the drop no longer lasts as long or lands on the same side, that answers 404 and the page shows the card without a replay. The board is drawn by `board.js`, which the game page uses too.
 
 Like the players table, the server reads who has a card once at startup (`load_card_holders()`), so a new visitor's page starts without asking the database, and looks up a returning player's best the first time they connect. If the database is down, cards are still made and shown, and wait in memory (up to 1,000) to be saved.
 
@@ -250,6 +260,7 @@ Each is one row of the `rounds` table:
 | `commit_id` | The version of the code that dropped the ball (Render's `RENDER_GIT_COMMIT`, or `local`). A round handed over during an update keeps the old server's. |
 | `gravity`, `bounce` | The physics options the ball was dropped with. |
 | `start_x` | Where along the top the ball dropped from, to 15 significant digits. |
+| `nudge`, `nudge_seed` | How big the ball's hidden turns at each pin bounce typically were, in radians, and the seed they were drawn from (see [The hidden nudges](#the-hidden-nudges)). Empty for rounds played before them, which had none. Run `schema.sql` to add these columns: until then the server saves rounds without them, and they can't be replayed exactly. |
 | `frames`, `close_frame` | How many frames (60 a second) the ball took to land, and the frame betting closed at. |
 | `bucket` | Where the ball landed. |
 | `path` | The ball's position at every frame, packed. |
@@ -258,7 +269,7 @@ Each is one row of the `rounds` table:
 | `rules` | Which pricing and counterparty rules the round was played by (`RULES_VERSION` in `app.py`). Rounds logged before the column existed are 1: each side's price was its fraction of all shares bought, and the counterparty bought one share at a time on whichever half the ball was in. In 2, prices follow the logistic curve and the counterparty is today's pretend traders, but a share was charged the price before the buy. 3 charges the market maker's cost of the buy instead. 4 lets that cost reach 1.00, where 3 stopped at 0.99. `analysis.py` keeps all four, so old rounds still read back right. |
 | `timing` | When each broadcast went out and each buy was taken, to the microsecond, packed (see [Timing](#timing)). Empty for rounds logged before the column existed. |
 
-A drop is decided entirely by `start_x`, `gravity` and `bounce`: the same three numbers give exactly the same path on any computer. So the analysis plays each round again to get the ball's exact position and velocity at every frame, and nothing about the ball is stored per buy. The saved `path` (under a kilobyte) is there to check the replay against, and to fall back on if the physics in `app.py` ever changes. If it does, a round still replays under the version in its `commit_id`.
+A drop is decided entirely by `start_x`, `gravity`, `bounce`, `nudge` and `nudge_seed` (see [The hidden nudges](#the-hidden-nudges)): the same five numbers give exactly the same path on any computer. Rounds played before the nudges have none, and replay without them. So the analysis plays each round again to get the ball's exact position and velocity at every frame, and nothing about the ball is stored per buy. The saved `path` (under a kilobyte) is there to check the replay against, and to fall back on if the physics in `app.py` ever changes. If it does, a round still replays under the version in its `commit_id`.
 
 The database gives `start_x` back to 15 significant digits, where a number like it needs 17 to come back exactly, and the path is chaotic: a replay from 15 digits parts from the real drop a few hundred frames in. So the server rounds `start_x` to 15 digits before it drops the ball, and the drop that is played is the one that is saved. Rounds logged before that was done mostly don't replay to their saved path; `analysis.py` says how many, and falls back on the saved path for their positions. Their counterparty buys, worked out again from `start_x`, can be off by a share or two as well.
 
@@ -405,17 +416,18 @@ Since then, `start_x` comes from the operating system's randomness (`random.Syst
 
 ## Tuning the physics
 
-Gravity and bounce can be passed on the command line:
+Gravity, bounce and the hidden nudges can be passed on the command line:
 
 ```
-uv run app.py --gravity 1500 --bounce 0.3
+uv run app.py --gravity 1500 --bounce 0.3 --nudge 0
 ```
 
 | Option      | Default | Meaning                                                        |
 | ----------- | ------- | -------------------------------------------------------------- |
 | `--gravity` | 400     | Downward acceleration, in pixels / second². Higher is faster.  |
 | `--bounce`  | 0.85    | Fraction of speed kept after hitting a pin or wall, 0 to 1. Lower makes the ball slow down more in the dense rows. |
+| `--nudge`   | 0.003   | Typical size, in radians, of the hidden random turn at each pin bounce (see [The hidden nudges](#the-hidden-nudges)). 0 for none, which lets players work out the rest of the drop from the path. |
 
 Everything else (board size, pin rows, ball and pin size) is a constant at the top of `app.py`.
 
-The round log saves the gravity and bounce each round was played with, so rounds played under different options replay correctly. A change to one of the constants is only recorded as a new `commit_id`.
+The round log saves the gravity, bounce and nudges each round was played with, so rounds played under different options replay correctly. A change to one of the constants is only recorded as a new `commit_id`.
