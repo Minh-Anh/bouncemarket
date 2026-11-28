@@ -9,6 +9,7 @@ import contextlib
 import datetime
 import hmac
 import html
+import ipaddress
 import json
 import math
 import os
@@ -52,9 +53,14 @@ FINAL_STRETCH_FRAMES = 90  # for the last 1.5 seconds before betting closes, and
 EARLY_AHEAD_FRAMES = 48  # before that, send positions this far ahead (0.8 seconds), so a message is needed only every half second
 POSITION_DECIMALS = 1  # ball positions are sent rounded to tenths of a pixel; 0 (whole pixels) is ~15% smaller but may look steppy
 BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the page can play back smoothly
-RULES_VERSION = 3  # saved with each round; change it whenever the pricing or the counterparty changes, so analysis.py replays each round under its own rules
+RULES_VERSION = 4  # saved with each round; change it whenever the pricing or the counterparty changes, so analysis.py replays each round under its own rules
 PRICE_SOFTNESS = 7  # how many more shares one side needs than the other for its price to reach 0.73 (see prices_for()); higher makes each share move the price less
 MAX_BUYS_PER_SECOND = 10  # the most buys one player can make in any one second; a person clicks 5 to 8.5 times a second, a script far faster
+# Limits on open pages, so that nobody can slow the game for everyone by opening thousands (see
+# take_slot()). Both can be set on the host without changing the code; 0 for no limit per address.
+MAX_STREAMS = int(os.environ.get("MAX_STREAMS", 1500))  # the most pages open at once. Past it a new page is told the game is full, and keeps trying. Set it to what the server can carry
+MAX_STREAMS_PER_ADDRESS = int(os.environ.get("MAX_STREAMS_PER_ADDRESS", 20))  # the most from one internet address: plenty for a household, an office or a classroom, which share one
+STREAM_LOG_SECONDS = 60  # how often the log says who has many pages open and who was turned away, when anyone has or was
 # The counterparty (see Counterparty): a few pretend traders, buying the way a person would.
 COUNTERPARTY_TRADERS = 5  # how many; one alone can't click fast enough to keep up with the ball near the bottom. Each player who buys takes one's place
 COUNTERPARTY_FULL_LEAN = 0.5  # a ball this far from the middle towards a wall counts as fully on its side (see counterparty_guess())
@@ -92,6 +98,18 @@ SHARE_ID = re.compile(r"[A-Za-z0-9_-]{8}")  # what secrets.token_urlsafe(6) make
 # The handover: during an update the old server hands the whole game to the new one, so nobody
 # playing notices. See "The handover" below, and "Updating without stopping the game" in the README.
 INSTANCE = secrets.token_urlsafe(8)  # this running server's own name, made up afresh every time it starts
+# Where each ball drops from comes from the operating system's randomness, which can't be
+# predicted. Python's own random numbers (a Mersenne Twister) can: anyone who sees enough of
+# them can work out every one to come, and the whole drop follows from where the ball starts.
+# Players tried exactly that, working start_x out from the paths (see "An attempt on the
+# random numbers" in the README).
+drop_random = random.SystemRandom()
+# The order pages are sent each broadcast in. Shuffling a thousand pages ten times a second
+# with the operating system's randomness takes milliseconds each time, during which the game
+# waits, so this is a Mersenne Twister, but its own, seeded from the operating system's
+# randomness and used for nothing else: the order is never shown to anyone, and nothing about
+# the ball could be learned from it.
+send_order_random = random.Random(secrets.randbits(256))
 # The address the site is reached at from outside, which is how the old and the new server find
 # each other. Render sets RENDER_EXTERNAL_URL; without either, there are no handovers.
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
@@ -228,6 +246,14 @@ recent_buys = {}
 # Each message in a queue is (text, tag): tag is (started_at, index) for a broadcast during a
 # drop, so events() can note when it was written (see written_to), and None for anything else.
 streams = {}  # {queue: player_id}
+
+# How many pages each internet address has open, or is just opening: {address: count}, with
+# no entry for an address that has none. The address is None for a page whose address we
+# can't tell (see client_address()). slots_taken is the total. turned_away counts the
+# connections refused since log_streams() last wrote to the log, {address: count}.
+slots = collections.Counter()
+slots_taken = 0
+turned_away = collections.Counter()
 
 # The newest broadcast of this round written to each player's pages, and when, in seconds since
 # the drop: {player_id: (index in game["broadcasts"], seconds)}. If a player has more than one
@@ -706,13 +732,21 @@ def costs_for_net(net):
     is 1 minus the other. So any set of buys that's sure to pay costs exactly what it pays, and
     rounding to the nearest cent, not up, keeps the house from taking a cut. At 0.50 a side, a
     share costs 0.52.
+
+    A share can cost as much as 1.00, once its side is 37 shares ahead (at a PRICE_SOFTNESS of
+    7): it then pays back at most what it cost, so a ball that is plainly going one way is worth
+    nothing more to buy. Until rules version 4 the most was 0.99, and since every share past that
+    point still cost 0.99, players bought thousands a round of a side that nearly always won, a
+    cent at a time. Now their own buys carry the price to 1.00 within a few shares. The least is
+    still 0.01, so no share is ever free: a free share would be worth buying however unlikely.
+    Past 37 ahead, that puts a pair of opposite buys a cent over the 1 point they pay.
     """
     left_chance = 1 / (1 + math.exp(-net / PRICE_SOFTNESS))
     step = math.exp(1 / PRICE_SOFTNESS)
 
     def cost(chance):
         exact = PRICE_SOFTNESS * math.log(1 - chance + chance * step)
-        return min(0.99, max(0.01, round(exact, 2)))  # never free, and never a sure loss
+        return min(1.0, max(0.01, round(exact, 2)))  # never free
 
     return {"left": cost(left_chance), "right": cost(1 - left_chance)}
 
@@ -1414,7 +1448,7 @@ async def run_rounds():
             # double needs 17 to come back exactly, and the path is chaotic, so a replay from
             # the 15 the round log holds would part from the real drop a few hundred frames in.
             # Any number of 15 digits does come back exactly, so this is the drop that was played.
-            start_x = float(f"{random.uniform(WIDTH / 6, WIDTH * 5 / 6):.15g}")
+            start_x = float(f"{drop_random.uniform(WIDTH / 6, WIDTH * 5 / 6):.15g}")
             states, bucket = simulate_drop(start_x, GRAVITY, BOUNCE)
             path = positions(states)
             last_row_frame = next(i for i, (x, y) in enumerate(path) if y > LAST_ROW_Y)
@@ -1566,7 +1600,7 @@ async def broadcast():
         text = sse("game", message)
         tag = None
         queues = list(streams)
-        random.shuffle(queues)
+        send_order_random.shuffle(queues)
         if dropping:
             tag = (game["started_at"], len(game["broadcasts"]))
             game["broadcasts"].append([time.time() - game["started_at"], None, None, len(queues), 0])
@@ -1607,6 +1641,102 @@ async def board(request):
     })
 
 
+def client_address(request):
+    """The internet address a page is connecting from, to count the pages each address has
+    open. None if we can't tell, and then the page isn't counted against any address.
+
+    We never see the address itself: on Render every connection reaches us from Render's own
+    proxy, and the visitor's address is in a header added on the way. CF-Connecting-IP is set
+    by Cloudflare, which Render puts in front of every service, whatever the visitor sent, so
+    it can't be forged. Failing that, the first address in X-Forwarded-For, which a visitor
+    can forge by sending the header themselves: the limit on all pages together (MAX_STREAMS)
+    still holds then. With neither header, as on your own computer, there is nothing to go by.
+
+    An IPv6 address is cut down to its network, the first half (a /64): the second half is
+    the visitor's own to choose, so one visitor has as many full addresses as they like.
+    """
+    text = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0]
+    try:
+        address = ipaddress.ip_address(text.strip())
+    except ValueError:
+        return None
+    if address.version == 6 and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped  # an IPv4 address written the IPv6 way, ::ffff:1.2.3.4
+    if address.version == 6:
+        return str(ipaddress.ip_network((address, 64), strict=False))
+    return str(address)
+
+
+def take_slot(address):
+    """Count one more page for this address. Returns None if it may open, or the answer to
+    send if it may not: the game is full (MAX_STREAMS), or this address already has
+    MAX_STREAMS_PER_ADDRESS open. Without these, one computer can open thousands of streams,
+    and every broadcast is then written thousands of times, which slows the game for everyone.
+
+    A page that is turned away shows a message and asks again by itself (connect() in
+    index.html). The slot is counted from this moment, before the player is even looked up,
+    so a burst of connections arriving together can't all slip in under the limit. It is
+    given back by give_back_slot(), when the stream ends or was never started.
+    """
+    global slots_taken
+    if slots_taken >= MAX_STREAMS:
+        problem, status = "the game is full right now.", 503
+    elif address is not None and MAX_STREAMS_PER_ADDRESS and slots[address] >= MAX_STREAMS_PER_ADDRESS:
+        problem, status = "too many pages are open from your network.", 429
+    else:
+        slots[address] += 1
+        slots_taken += 1
+        return None
+    turned_away[address] += 1
+    return JSONResponse({"error": problem}, status_code=status, headers={"Retry-After": "15"})
+
+
+def give_back_slot(address):
+    global slots_taken
+    slots_taken -= 1
+    slots[address] -= 1
+    if slots[address] <= 0:
+        del slots[address]
+
+
+class PageStream(StreamingResponse):
+    """A page's stream, which gives its slot back when it is over: when the page goes away,
+    when the game moves to a new server, and also if the page went away before the stream
+    had even started, when nothing inside the stream itself would get to run."""
+
+    def __init__(self, content, address, **kwargs):
+        super().__init__(content, **kwargs)
+        self.address = address
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            give_back_slot(self.address)
+
+
+async def log_streams():
+    """Every STREAM_LOG_SECONDS, write to the log who has many pages open and who was turned
+    away, if anyone has or was: enough to tell one computer opening thousands of pages from a
+    crowd of people. Addresses with only a few pages open are never written down."""
+    while True:
+        await asyncio.sleep(STREAM_LOG_SECONDS)
+        many = max(5, MAX_STREAMS_PER_ADDRESS // 2)
+        busiest = [(address, count) for address, count in slots.most_common(6) if address is not None and count >= many]
+        if not busiest and not turned_away and slots[None] < many:
+            continue  # many with no address is worth saying too: on Render it would mean the headers aren't what client_address() expects
+        said = [f"{slots_taken} pages open from {len(slots) - (None in slots)} addresses (the limits are {MAX_STREAMS}, and {MAX_STREAMS_PER_ADDRESS} from one address)."]
+        if slots[None]:
+            said.append(f"{slots[None]} of them came with no address, and aren't counted against one.")
+        if busiest:
+            said.append("Most from one address: " + ", ".join(f"{address} has {count}" for address, count in busiest[:5]) + ".")
+        if turned_away:
+            worst = ", ".join(f"{count} from {address or 'no address'}" for address, count in turned_away.most_common(5))
+            said.append(f"Turned away {sum(turned_away.values())} connections from {len(turned_away)} addresses in the last {STREAM_LOG_SECONDS} seconds: {worst}.")
+            turned_away.clear()
+        print(" ".join(said))
+
+
 async def events(request):
     """Stream messages to one player's page for as long as it stays open.
 
@@ -1616,12 +1746,22 @@ async def events(request):
     message (the top players, plus the players around it) when it connects and whenever the
     leaderboard is refreshed. If the player has a best-round card, a "card" message brings it
     when the page connects, and again whenever a round becomes their new best.
+
+    Only so many pages can be open at once, and so many from one address: see take_slot().
     """
     player_id = parse_id(request.query_params.get("player"))
     if player_id is None:
         return JSONResponse({"error": "bad player id."}, status_code=400)
-    player = await get_player(player_id)
-    await get_best_round(player_id)
+    address = client_address(request)
+    refusal = take_slot(address)
+    if refusal:
+        return refusal
+    try:
+        player = await get_player(player_id)
+        await get_best_round(player_id)
+    except BaseException:
+        give_back_slot(address)
+        raise
 
     async def stream():
         if game["role"] == "retired":
@@ -1651,7 +1791,7 @@ async def events(request):
 
     # The headers ask anything between the server and the browser not to hold events back.
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    return StreamingResponse(stream(), media_type="text/event-stream", headers=headers)
+    return PageStream(stream(), address, media_type="text/event-stream", headers=headers)
 
 
 async def buy(request):
@@ -2450,7 +2590,7 @@ async def lifespan(app):
     When it stops: if it still has the game, try once more to hand it to a new server, then
     save what is left to save.
     """
-    jobs = [load_ranking(), load_card_holders(), save_round_logs(), save_cards_forever()]
+    jobs = [load_ranking(), load_card_holders(), save_round_logs(), save_cards_forever(), log_streams()]
     tasks = [asyncio.create_task(job) for job in jobs]
     predecessor = await find_predecessor()
     if predecessor:

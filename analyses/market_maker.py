@@ -31,7 +31,8 @@ def exact_cost(net, side):
 
 
 db = analysis.connect()
-since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).isoformat()
+# The last hour, or from a time given as the first argument (e.g. 2026-11-27T21:59Z), to study one version's rounds.
+since = sys.argv[1] if len(sys.argv) > 1 else (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).isoformat()
 rows = []
 params = {"select": "*", "order": "id", "started_at": f"gte.{since}", "limit": 40}
 while True:
@@ -54,7 +55,8 @@ for row in rows:
     commits[row["commit_id"][:7]] += 1
     row["path"] = app.unpack_path(analysis.from_bytea(row["path"]))
     row["buys"] = app.unpack_buys(analysis.from_bytea(row["buys"]))
-    if analysis.rules(row) != 3:
+    version = analysis.rules(row)
+    if version < 3:
         continue
     bots = analysis.bot_buys(row)
     win = row["bucket"]
@@ -67,7 +69,7 @@ for row in rows:
         ex = exact_cost(net, side)
         if is_player:
             price = b[4]
-            if abs(app.costs_for_net(net)[side] - price) > 1e-9:
+            if abs(analysis.costs_for_net(version, net)[side] - price) > 1e-9:
                 mismatched_prices += 1
             paid += price
             won = side == win
@@ -76,7 +78,7 @@ for row in rows:
             frac = min(9, int(10 * f / max(1, row["close_frame"])))
             by_depth[frac][0] += 1
             by_depth[frac][1] += won - price
-            band = "0.99 (cap)" if price >= 0.99 else "0.01 (floor)" if price <= 0.01 else f"{int(price * 10) / 10:.1f}-{int(price * 10) / 10 + 0.1:.1f}"
+            band = "1.00" if price >= 1 else "0.99" if price >= 0.99 else "0.01 (floor)" if price <= 0.01 else f"{int(price * 10) / 10:.1f}-{int(price * 10) / 10 + 0.1:.1f}"
             by_price[band][0] += 1
             by_price[band][1] += won - price
         else:
@@ -93,7 +95,7 @@ for row in rows:
     mm_round.append(mm)
 
 n = tot["rounds"]
-print(f"rounds in the last hour: {len(rows)} (since {since[:19]}Z), commits {dict(commits)}; analysed {n} (rules 3)")
+print(f"rounds in the last hour: {len(rows)} (since {since[:19]}Z), commits {dict(commits)}; analysed {n} (rules 3 and later)")
 print(f"player buys {tot['n']:.0f}; logged prices not matching the rebuilt market: {mismatched_prices}")
 print(f"identity check, worst |mm - parts| in a round: {check_worst:.6f}")
 print(f"players paid {tot['paid']:.2f}, paid out {tot['payout']:.2f}")

@@ -107,17 +107,18 @@ def rounds(db=None):
         states, bucket = app.simulate_drop(row["start_x"], row["gravity"], row["bounce"])
         row["states"] = states if app.positions(states) == row["path"] and bucket == row["bucket"] else None
         row["bot_buys"] = bot_buys(row)
-        row["prices_for"] = {1: prices_v1, 2: app.prices_for, 3: app.costs_for}[rules(row)]
+        row["prices_for"] = {1: prices_v1, 2: app.prices_for, 3: costs_v3, 4: app.costs_for}[rules(row)]
         row["timing"] = app.unpack_timing(from_bytea(row["timing"])) if row.get("timing") else None
         yield row
 
 
 def rules(row):
     """Which pricing and counterparty rules a logged round was played by. Rounds logged before
-    the column existed were version 1. Versions 2 and 3 have the same counterparty; version 3
-    charges each buy the market maker's cost (app.costs_for_net()), not the price before it."""
+    the column existed were version 1. Versions 2 to 4 have the same counterparty; version 3
+    charges each buy the market maker's cost (app.costs_for_net()), not the price before it, and
+    version 4 lets that cost go up to 1.00, where 3 stopped at 0.99."""
     version = row.get("rules", 1)
-    if version not in (1, 2, 3) or version > app.RULES_VERSION:
+    if version not in (1, 2, 3, 4) or version > app.RULES_VERSION:
         raise SystemExit(f"round {row['id']} was played by rules version {version}, which this version of app.py doesn't have")
     return version
 
@@ -137,6 +138,17 @@ def prices_v1(left, right):
     left, right = left + 3, right + 3
     left_price = min(0.99, max(0.01, round(left / (left + right), 2)))
     return {"left": left_price, "right": round(1 - left_price, 2)}
+
+
+def costs_v3(left, right):
+    """What a share was charged in version 3 rounds: today's cost, but never more than 0.99."""
+    return {side: min(0.99, cost) for side, cost in app.costs_for(left, right).items()}
+
+
+def costs_for_net(version, net):
+    """What a share was charged in a round played by rules version 3 or later, as
+    app.costs_for_net() gives it for today's rules."""
+    return costs_v3(net, 0) if version == 3 else app.costs_for_net(net)
 
 
 def counterparty_v1(path, close_frame):

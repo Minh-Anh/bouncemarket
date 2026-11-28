@@ -185,8 +185,9 @@
     #leaderboard .gap { color: var(--muted); }  /* the "…" between the top 10 and the rows around you */
 
     /* The banner the owner can put up before a system update (see showNotice()), above the game.
-       Unlike the rest of the page it isn't lowercase: it's the site speaking, not the game. */
-    #notice { margin-bottom: 14px; border: 1px solid var(--accent); font-size: 14px; }
+       Unlike the rest of the page it isn't lowercase: it's the site speaking, not the game.
+       #waiting is the same for a page the server has no room for yet (see connect()). */
+    #notice, #waiting { margin-bottom: 14px; border: 1px solid var(--accent); font-size: 14px; }
     #notice button {
       padding: 0; border: none; background: none; font: inherit; font-weight: bold;
       color: var(--accent); text-decoration: underline; cursor: pointer;
@@ -204,6 +205,7 @@
   </header>
 
   <p class="panel" id="notice" role="status" hidden></p>
+  <p class="panel" id="waiting" role="status" hidden>The game is full right now, or too many pages are open from your network. This page will keep trying, and joins as soon as there's room.</p>
 
   <main>
     <section id="game">
@@ -316,6 +318,8 @@
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
     const FPS = 60;  // the ball moves one frame every 1/60 second
+    const FULL_RETRY_MS = [10000, 20000];  // turned away because the game is full, the page asks again after a wait between these
+    const NEW_DROP_MS = 5000;  // a drop that began this far from when we thought is a different drop (the wait between drops alone is this long)
     const MIN_ONLINE_SHOWN = 5;  // the header says how many are online only when at least this many are
     const FADE_RATE = 4;  // how sharp the landing highlight's fade is: higher makes the start and end quicker and the middle flatter
     // The color behind the board: the page's own background, read from the palette at the top of the file.
@@ -738,7 +742,15 @@
       } else {
         dropsAt = null;
         // game.frame is the frame the server is on right now, which tells us when the drop began.
-        if (dropStart === null) dropStart = performance.now() - game.frame * 1000 / FPS;
+        // If that is nowhere near when we thought it began, this is a later drop: the stream was
+        // cut for a while and we missed the end of the one before. Start this one afresh.
+        const began = performance.now() - game.frame * 1000 / FPS;
+        if (dropStart !== null && Math.abs(began - dropStart) > NEW_DROP_MS) {
+          queue = [];
+          dropStart = null;
+          shownFrame = null;
+        }
+        if (dropStart === null) dropStart = began;
         game.positions.forEach(([x, y], i) => queue.push([game.first_position + i, x, y]));
       }
       render();
@@ -768,12 +780,27 @@
       canvas.width = board.width;
       canvas.height = board.height;
       draw(null);
-      // The server sends a stream of messages for as long as the page is open: a private
-      // "me" message with our name, points and shares, the public "game" message, and the leaderboard.
-      // If the connection drops, the browser reconnects by itself. That is also how we follow
-      // the game to a new server during an update: the old server ends the stream, the browser
-      // connects again, and the new server carries on from the same frame.
+      connect();
+      requestAnimationFrame(play);
+    }
+
+    // The server sends a stream of messages for as long as the page is open: a private
+    // "me" message with our name, points and shares, the public "game" message, and the leaderboard.
+    // If the connection drops, the browser reconnects by itself. That is also how we follow
+    // the game to a new server during an update: the old server ends the stream, the browser
+    // connects again, and the new server carries on from the same frame.
+    function connect() {
       const stream = new EventSource("/events?player=" + playerId);
+      const waiting = document.getElementById("waiting");
+      stream.onopen = () => { waiting.hidden = true; };
+      // The browser gives up, for good, only when the server answers but won't open a stream:
+      // it is full, or too many pages are open from our network (see take_slot() in app.py).
+      // Then we say so and ask again ourselves, each page after a different wait.
+      stream.onerror = () => {
+        if (stream.readyState !== EventSource.CLOSED) return;  // just a dropped connection, which the browser retries
+        waiting.hidden = false;
+        setTimeout(connect, FULL_RETRY_MS[0] + Math.random() * (FULL_RETRY_MS[1] - FULL_RETRY_MS[0]));
+      };
       // A "me" message comes after each round, which makes any "reset once this round is over" out of date.
       stream.addEventListener("me", (event) => { me = JSON.parse(event.data); clearResetErrors(); render(); showLeaderboard(); });
       stream.addEventListener("leaderboard", (event) => { leaderboard = JSON.parse(event.data); showLeaderboard(); });
@@ -785,7 +812,6 @@
         cardFresh = message.fresh ? "waiting" : null;
         showCard();
       });
-      requestAnimationFrame(play);
     }
     init();
   </script>

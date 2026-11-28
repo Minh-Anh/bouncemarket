@@ -30,5 +30,6 @@ for row in rows:
     states, bucket = app.simulate_drop(row["start_x"], row["gravity"], row["bounce"])
     row["states"] = states if app.positions(states) == row["path"] and bucket == row["bucket"] else None
     row["bot_buys"] = analysis.bot_buys(row)
+    row["timing"] = app.unpack_timing(analysis.from_bytea(row["timing"])) if row.get("timing") else None
 pickle.dump({"rows": rows, "names": analysis.names(db)}, open(out, "wb"))
 print(len(rows), "rounds", rows[0]["started_at"], "..", rows[-1]["started_at"])

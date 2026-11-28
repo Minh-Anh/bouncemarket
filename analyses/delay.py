@@ -16,6 +16,7 @@ import os
 import sys
 
 sys.path.insert(0, os.environ.get("BOUNCEMARKET_CODE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))  # the app.py to use: this repo, or BOUNCEMARKET_CODE
+import analysis
 import app
 
 d = pickle.load(open(sys.argv[1], "rb"))
@@ -59,7 +60,7 @@ for g, keys in groups.items():
                 else:
                     net_all = cum[bisect.bisect_left(frames, f + dly)]
                     mine_after = own_cum[bisect.bisect_left(own_frames, f + dly)] - own_cum[idx]
-                    cost = app.costs_for_net(net_all - mine_after)[side]
+                    cost = analysis.costs_for_net(r.get("rules", 3), net_all - mine_after)[side]
                 profit[dly] += won - cost
     if not n:
         continue

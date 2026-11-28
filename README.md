@@ -57,6 +57,8 @@ Both sides start at 0.50 each round, and the two prices always add up to 1. A si
 
 The price on each side's card is what a share costs you, which is a little more than the market's chance for that side, shown in the odds bar. Your buy moves the price, so you pay the average price along that move, not the price before it: the cost a logarithmic market maker charges (`costs_for_net()` in `app.py`), rounded to the nearest cent. At 0.50 a side, a share costs 0.52. Charging the price before the move gave away about half a price step on every share, and let a script buy Left at 0.50 and then Right at 0.46, for a pair sure to pay 1.00. At the market maker's cost, equal shares on both sides always cost exactly what they are sure to pay, so there is nothing to gain from buying both sides, and the house takes no cut.
 
+A share costs at least 0.01 and at most 1.00. A side 37 shares ahead costs 1.00, which is all it can pay back, so once a ball is plainly going one way there is nothing left to make by buying it. Until rules version 4 the most was 0.99, and every share past that point still cost 0.99: a few players bought thousands a round of the side that was all but sure, winning a cent nearly every time (see [After the update](#after-the-update-what-the-timing-log-shows)). Now their own buys carry the price to 1.00 within a few shares. The least stays at 0.01, since a free share would be worth buying however unlikely its side. Beyond 37 ahead, that puts a Left share and a Right share a cent over the 1 point the pair pays.
+
 Each player can buy at most 10 shares in any one second (`MAX_BUYS_PER_SECOND`). A person clicks 5 to 8.5 times a second; a buy past the limit is turned down.
 
 There is also a counterparty, so the market moves even with nobody else on: five pretend traders who buy the way a person might. Each guesses where the ball will land with a naive rule: the further it is from the middle and the lower it is, the surer they get. Each looks at the ball and the price; if the price is off from their guess by 0.03 or more, they buy one share of the side that looks too cheap and look again a moment later, at a person's clicking speed (5 to 8.5 clicks a second), and otherwise they look again after a short pause. That makes bursts of buying, sometimes two traders in the same instant. Their buying drifts the price towards where the ball seems to be heading, hardest near the bottom, and they push back when players pile onto the side the ball isn't on.
@@ -176,6 +178,25 @@ The `name_locked` column must exist before these work: run `schema.sql` again (i
 
 During a deploy, a command can reach the old server just as it hands the game over. It then answers `503` with `"moved": true` and has changed nothing: run the command again. If a handover fails (see [Updating without stopping the game](#updating-without-stopping-the-game)), the previous server keeps running for a minute or so and may save a round's points under the old name, undoing a rename made meanwhile. If that happens, rename again once the deploy has finished.
 
+## Limits on open pages
+
+Every open page holds a stream, and every broadcast is written to every stream, so one computer opening thousands of streams slows the game for everyone. Two limits stop that, both settable as environment variables on the host:
+
+| Variable | Default | |
+| --- | --- | --- |
+| `MAX_STREAMS_PER_ADDRESS` | 20 | The most pages open from one internet address. A household, an office or a classroom shares one address, so it isn't small. A page past the limit gets `429`. `0` turns it off. |
+| `MAX_STREAMS` | 1500 | The most pages open at once. Past it a new page gets `503`, and the players already in keep a quick game. Set it to what the server can carry. |
+
+A page that is turned away says so, and asks again by itself every 10 to 20 seconds until there is room.
+
+The server never sees a visitor's address directly, as every connection reaches it from Render's proxy. It reads the address from the `CF-Connecting-IP` header, which Cloudflare (in front of every Render service) sets and a visitor can't forge, and failing that from the first address in `X-Forwarded-For`, which a visitor can forge. An IPv6 address counts as its network (the first half, a /64). With neither header, as on your own computer, pages aren't counted against an address, only against `MAX_STREAMS`.
+
+Once a minute, if anyone was turned away or one address holds many pages, the server says so in the log:
+
+`1203 pages open from 961 addresses (the limits are 1500, and 20 from one address). Most from one address: 203.0.113.7 has 20. Turned away 2950 connections from 3 addresses in the last 60 seconds: 2948 from 203.0.113.7, ...`
+
+A few addresses turned away thousands of times is one person's script. If the line says many pages "came with no address", the headers aren't what the server expects and the limit per address isn't working. The limits are per address, so they don't stop a flood from thousands of different addresses: that needs a filter in front of the server, such as Cloudflare's rate limiting.
+
 ## Announcing an update
 
 An update normally carries everyone's points over to the new server (see [Updating without stopping the game](#updating-without-stopping-the-game)). It can't when the old server doesn't know how to hand over, or the new one can't read what it is handed: the first deploy of the handover code itself, and any deploy that changes `HANDOVER_FORMAT`. Then guests (players without a username) lose their points, as they do if a handover fails. To warn them first, put up a banner on every open page that counts down to the update. With `ADMIN_KEY` and `SITE` set as above, for an update in 15 minutes:
@@ -234,7 +255,7 @@ Each is one row of the `rounds` table:
 | `path` | The ball's position at every frame, packed. |
 | `buys`, `n_buys` | Every buy, in order, packed, and how many there are. |
 | `format` | How `path` and `buys` are packed (`LOG_FORMAT` in `app.py`). |
-| `rules` | Which pricing and counterparty rules the round was played by (`RULES_VERSION` in `app.py`). Rounds logged before the column existed are 1: each side's price was its fraction of all shares bought, and the counterparty bought one share at a time on whichever half the ball was in. In 2, prices follow the logistic curve and the counterparty is today's pretend traders, but a share was charged the price before the buy. 3 charges the market maker's cost of the buy instead. `analysis.py` keeps all three, so old rounds still read back right. |
+| `rules` | Which pricing and counterparty rules the round was played by (`RULES_VERSION` in `app.py`). Rounds logged before the column existed are 1: each side's price was its fraction of all shares bought, and the counterparty bought one share at a time on whichever half the ball was in. In 2, prices follow the logistic curve and the counterparty is today's pretend traders, but a share was charged the price before the buy. 3 charges the market maker's cost of the buy instead. 4 lets that cost reach 1.00, where 3 stopped at 0.99. `analysis.py` keeps all four, so old rounds still read back right. |
 | `timing` | When each broadcast went out and each buy was taken, to the microsecond, packed (see [Timing](#timing)). Empty for rounds logged before the column existed. |
 
 A drop is decided entirely by `start_x`, `gravity` and `bounce`: the same three numbers give exactly the same path on any computer. So the analysis plays each round again to get the ball's exact position and velocity at every frame, and nothing about the ball is stored per buy. The saved `path` (under a kilobyte) is there to check the replay against, and to fall back on if the physics in `app.py` ever changes. If it does, a round still replays under the version in its `commit_id`.
@@ -332,6 +353,55 @@ foob is also first to the server. At the start of a drop, when every page hears 
 Zone, Precogbot and martin lean about 3 points more towards the frames they've been sent than towards ones nobody has, which fits reading the stream, but most of their lean is forecasting, and with buys coming in bursts a gap that size could be noise. foob shows none of it: it is fast, not peeking. prrrrrrrrrrrrr is the odd one, better at frames not yet sent than at ones it has, which fits running the physics forward. The lookahead was kept at 48 frames: trading on the buffered frames is part of the game. Comparing the excess early in a drop (48 frames ahead) with the final stretch (12 ahead) would show more.
 
 **Everyone else** (all but foob, martin and tokenmaxer_bot) loses slowly: −842 points over 626,319 buys in the 600 rounds, about −0.001 a share, mostly buying the side the ball is on (55% of buys), with no edge at any delay.
+
+### After the update: what the timing log shows
+
+A second study, of the first 141 rounds played under `e621554` (21:59 to 22:29 UTC on 27 November 2026), with the timing log, the shuffled send order and `start_x` rounded: 126,156 buys by 671 players, about 456 pages open. Every round replays exactly. Half an hour is a small sample beside the 600 rounds above, so read the smaller differences with care. The scripts are the same, plus [`timing.py`](analyses/timing.py).
+
+**The house loses more, through the 0.99 limit.** It lost every round, 7.56 points each: the pricing's built-in loss is the same 4.83, but rounding and the price limits now cost 2.81 a round, against 0.16 before. 58,682 buys, 46% of all of them, were at the 0.99 limit, and 99.8% of those won: +456 points, a cent at a time, for shares the pricing would have charged about 0.998 for. A dozen players do it in volume, all late in the drop and none losing a single one: le-botty, prrrrrrrrrrrrr, hydrogen, Precogbot, Zone, kittens and martin about 4,000 each. For Zone (98%), kittens (99%) and martin (91%) it is nearly all they buy. Neither the pricing nor the limits changed in the update; players have copied what foob did late in a drop. The take is capped only by `MAX_BUYS_PER_SECOND`. Rules version 4 ended it by letting the price reach 1.00. Priced that way, 57,080 of these 58,682 buys would have cost 1.00, and together they would have lost 115 points instead of making 456.
+
+**Who wins.** doober (+416) and foob (+409) are level, then hydrogen (+249), prrrrrrrrrrrrr (+197), hurf (+152), le-botty (+139) and Precogbot (+118). foob makes 2.9 a round, against 5.1 before, and 0.069 a share, against 0.12. martin has nearly stopped making money (+18; +0.005 a share, against +0.08). The cheap side is still where the money is: shares bought at 0.10 to 0.40 made 0.08 to 0.13 each, and at 0.60 to 0.90 lost 0.05 to 0.07. only_left (−253) and only_right always buy the same side.
+
+**A broadcast reaches every page within about 20 ms.** It is written to the first page and the last 19.7 ms apart (median; 90% within 23 ms). So a page's place in the order is now worth at most 20 ms, and on average nothing.
+
+**foob is fast; the send order doesn't explain it.** It still bought first in 73 of the 141 rounds, 59% of those it bought early in (63% before). Its buy reached the server a median 25 ms after the broadcast was written to it, and 13 ms in its fastest tenth: there and back across the network, plus whatever its code takes, in that time. So it sits very near the server and its code adds next to nothing. In 30 of the 134 rounds it played, it let the first broadcast go and bought on a later one. Its lead over doober in the opening race (83 ms) is four times the whole spread of the send order, and the round's first buyer had been written in the first half of the order in only 33 of 139 rounds. The question the first study left open is settled: it is foob's network and code, not its place in the order.
+
+**The money is in the first 40 ms after a broadcast.** Early in a drop a broadcast goes out about every 0.6 s, carrying the next 0.8 s of the ball's path and a price that has not moved since the last one. Profit a share of every buy in that part of the drop, by how long after the broadcast was written to the buyer it was taken:
+
+| Answered within | 0–40 ms | 40–80 ms | 80–150 ms | 150–300 ms | 300–600 ms |
+| --------------- | ------- | -------- | --------- | ---------- | ---------- |
+| Everyone | +0.057 (11,270 buys) | +0.018 | +0.005 | −0.001 | −0.003 |
+| foob | +0.161 (2,008) | +0.034 | +0.054 | −0.026 | +0.053 |
+| doober | +0.154 (968) | +0.034 | −0.008 | +0.060 | +0.066 |
+| everyone but the nine players studied | +0.004 | −0.001 | −0.006 | −0.013 | −0.018 |
+
+The first 40 ms took about 640 points over the half hour, more than half of everything players made. The price the broadcast showed is stale by the time anyone answers, and the first to answer buy it before it moves. Few answer that fast as a habit. With broadcasts 0.6 s apart, a player who buys at random times has about a sixth of their buys within 100 ms of one by chance. alef has 99% (median 26 ms, but only 321 buys), foob 64% (26 ms), hydrogen 43% (54 ms) and garethgeorge 42% (49 ms). kitsu has 74%, but never under 77 ms: a script on a distant network. Nearly everyone else is at chance.
+
+**Some answer on a timer.** doober's first buy of a drop comes 137 to 230 ms after the write, every round. Its fastest answers later in the drop take 13 ms, so its network is fast and the wait is its own. hurf answers about 156 ms after each broadcast, give or take 8 ms. prrrrrrrrrrrrr's first buy reached the server before any broadcast of the round had been written to it in 20 rounds: it times its first buy off the countdown and buys without seeing anything.
+
+**Some keep several pages open.** When a player has more than one page open, the log keeps the latest write to any of them, so their place in the order looks late. From how late, prrrrrrrrrrrrr keeps about 4.6 pages open, foob 4.1, alef 3.5, le-botty 3.2, tokenmaxer_bot 3.1 and goober 2.9. With the order shuffled, that is the one way to be written early more often, but over 20 ms it is worth only a few milliseconds. It also makes their answers look a few milliseconds quicker than they are. Logging the earliest write as well would measure it.
+
+**hurf's page isn't the game's.** Every page reports the frame it is showing behind the server's frame. hurf's reports one about 29 frames (0.5 s) ahead, so it is showing the buffered frames. But hurf wins on price, not on the future: it buys the cheap side (average price 0.41, won 47%, +0.06 a share), and its edge hardly fades with delay (76% left after 200 ms).
+
+**The sign of reading the buffered frames has gone.** With exact replays, no player leans towards the frames they have been sent any more than towards the frames nobody has: Zone 54.2% against 55.8% for the control, Precogbot 50.4% against 51.6%. The 3-point lean the first study found was most likely noise, as it allowed.
+
+**The pack still follows foob.** In the 200 ms after one of foob's 1,441 bursts, others bought 24,093 shares on its side and 13,593 on the other; garethgeorge (90%), hydrogen (81%) and prrrrrrrrrrrrr (78%) most of all.
+
+### An attempt on the random numbers
+
+The player behind Precogbot told the story on Hacker News. They spent about four hours trying to predict where each ball would drop, which would have meant knowing every round's winner before betting opened.
+
+The attack was a real one. Until `e621554`, where the ball dropped from came from Python's `random.uniform()`, and nothing else drew on Python's random numbers between drops (only the owner renaming a player does). Python's random numbers come from a Mersenne Twister. It isn't made to keep secrets: from about 20,000 bits of its output, anyone can work out its whole state, and with it every number to come. Each drop's `start_x` carries 53 of those bits. The ball's path is sent to every page, the physics is in the open and the same everywhere, and the path is chaotic. So searching for the starting point that gives a path, to the tenth of a pixel it is sent at, pins `start_x` down very closely, and they did that well. Knowing the top 40 bits or so of each would take about 500 rounds, two or three hours of play; they planned on 600.
+
+Three things got in their way, none of them meant to:
+
+- **A restart.** Every new server starts the Mersenne Twister afresh from the operating system's randomness, so the rounds they had collected told them nothing about the next ones.
+- **`start_x` rounded to 15 significant digits** (`e621554`, for exact replays from the round log). It loses about 5 of the 53 bits, which means collecting more rounds, not giving up.
+- **The shuffled send order** (`e621554`, so that no page always hears first). That is what made it hopeless. Each broadcast shuffles the open pages, several hundred of them, with the same Mersenne Twister, up to 10 times a second. Tens of thousands of its numbers now go by between one drop and the next, and how many depends on the numbers themselves.
+
+It never paid off. Had it worked, Precogbot would have bought the winning side early, at about 0.50, nearly every round. Instead its buys in the first third of the betting window won 52 to 75% of the time, hour by hour, at an average of 0.52 to 0.92: ordinary buying of whichever side looked likely. In the half hour after the update, a third of its profit (40 of 118 points) came from the 0.99 limit.
+
+Since then, `start_x` comes from the operating system's randomness (`random.SystemRandom()`), which can't be predicted from anything a player sees. The send order has a Mersenne Twister of its own, seeded the same way, which is far quicker for shuffling a thousand pages ten times a second. Nobody is ever shown the order, and it says nothing about the ball.
 
 ## Tuning the physics
 
