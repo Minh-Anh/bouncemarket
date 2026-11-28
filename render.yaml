@@ -6,11 +6,11 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
-    healthCheckPath: /health  # a new server gets requests once this answers; see "Updating without stopping the game" in the README
+    healthCheckPath: /health  # a new server gets requests once this answers; see docs/deploys.md
     envVars:  # set these in the Render dashboard; "sync: false" keeps their values out of this file
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
         sync: false
-      - key: ADMIN_KEY  # optional: the owner's key for moderating names, see the README
+      - key: ADMIN_KEY  # optional: the owner's key for moderating names, see docs/moderation.md
         sync: false

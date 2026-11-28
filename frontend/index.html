@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Tells phones to lay the page out at their real width instead of a zoomed-out desktop width. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bouncemarket</title>
+  <!-- What search results and link previews say about the page. -->
+  <meta name="description" content="a ball will fall. trade on where it lands.">
+  <!-- The color phones give the browser's own bars: the page's background. -->
+  <meta name="theme-color" content="#111111">
+  <!-- The icon on the browser tab: the yellow ball on the page's background. It is written here
+       as a tiny drawing, so the server has no icon file to send. %23 stands for "#". -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111'/><circle cx='16' cy='16' r='7' fill='%23fc3'/></svg>">
+  <!-- What chat and social apps show when someone pastes the link (the "Open Graph" tags). -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="bouncemarket">
+  <meta property="og:description" content="a ball will fall. trade on where it lands.">
+  <meta property="og:url" content="https://bouncemarket.minhanhday.com/">
+  <meta name="twitter:card" content="summary">
+  <!-- The best-round card's own styles, shared with the share page (see card.js). -->
+  <link rel="stylesheet" href="/card.css">
+  <link rel="stylesheet" href="/game.css">
+</head>
+<body>
+<div id="page">
+  <header>
+    <div id="title-row">
+      <h1>bouncemarket</h1>
+      <span class="muted" id="header-notes"><span id="countdown"></span><span id="online"></span></span>
+    </div>
+    <div id="header-side"><a class="credit" href="https://minhanhday.com/code" target="_blank" rel="noopener">created by minh-anh day</a></div>
+  </header>
+
+  <p class="panel" id="notice" role="status" hidden></p>
+  <p class="panel" id="waiting" role="status" hidden>The game is full right now, or too many pages are open, or too many new players have joined, from your network. This page will keep trying, and joins as soon as there's room.</p>
+
+  <main>
+    <section id="game">
+      <div class="panel" id="board"><canvas id="canvas"></canvas></div>
+
+      <div id="status-line">
+        <span id="status">&nbsp;</span>
+        <span><span class="muted">balance:</span> <span id="balance"></span></span>
+      </div>
+
+      <div id="market">
+        <div class="side panel" id="left-side">
+          <p class="label">Left</p>
+          <p class="muted">price per share</p>
+          <p class="price" id="price-left"></p>
+          <p class="muted holding">you hold <span id="shares-left">0</span><span class="net" id="net-left"></span></p>
+          <button data-side="left">buy 1 share<kbd>←</kbd></button>
+        </div>
+        <div class="side panel" id="right-side">
+          <p class="label">Right</p>
+          <p class="muted">price per share</p>
+          <p class="price" id="price-right"></p>
+          <p class="muted holding">you hold <span id="shares-right">0</span><span class="net" id="net-right"></span></p>
+          <button data-side="right">buy 1 share<kbd>→</kbd></button>
+        </div>
+      </div>
+
+      <div>
+        <div id="market-note">
+          <p class="muted">each winning share pays 1 point. prices change based on the number of shares purchased on either side.</p>
+          <button type="button" id="broke-reset" hidden>reset to 10</button>
+        </div>
+        <p class="muted" id="broke-error"></p>
+      </div>
+    </section>
+
+    <section id="sidebar">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>market odds</h2>
+          <span class="muted" id="odds-status"></span>
+        </div>
+        <div id="odds-labels"><span id="odds-left-label"></span><span id="odds-right-label"></span></div>
+        <div id="odds-bar"><div id="odds-left"></div><div id="odds-right"></div></div>
+      </div>
+      <!-- Our best single round, once we've had one that made more than 1.00 (see showCard()). -->
+      <div id="best-round" hidden></div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>leaderboard</h2>
+        </div>
+        <ol id="leaderboard"></ol>
+        <p class="muted" id="leaderboard-error"></p>
+      </div>
+      <p id="credit-bottom"><a class="credit" href="https://minhanhday.com/code" target="_blank" rel="noopener">created by minh-anh day</a></p>
+    </section>
+  </main>
+</div>
+
+  <!-- The reset button shown on our own leaderboard row: two circling arrows. -->
+  <template id="reset-icon">
+    <button class="reset" type="button" aria-label="reset to 10 points" title="reset to 10 points">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>
+        <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>
+      </svg>
+    </button>
+  </template>
+
+  <!-- The pencil button shown after our own name on the leaderboard, to change it. -->
+  <template id="rename-icon">
+    <button class="rename" type="button" aria-label="change username" title="change username">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>
+      </svg>
+    </button>
+  </template>
+
+  <!-- Opened from the "set username" button on a guest's own leaderboard row, to pick a first
+       name, and from the pencil on a named player's row, to change it. openNameDialog() fills
+       in the heading, the explanation and the button to suit. -->
+  <dialog id="claim-dialog">
+    <h2 id="claim-title"></h2>
+    <p id="claim-text"></p>
+    <form id="claim">
+      <!-- No capitals, corrections or spelling marks from phone keyboards: a username isn't a word.
+           Characters a username can't have are dropped as they're typed or pasted (see keepAllowed()). -->
+      <input id="name" placeholder="your username" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <p class="muted" id="claim-error"></p>
+      <div class="dialog-buttons">
+        <button type="button" id="claim-cancel">cancel</button>
+        <button id="claim-confirm"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="reset-dialog">
+    <h2>reset your points?</h2>
+    <p>you'll go from <span id="reset-points"></span> back to 10.00 points. this can't be undone.</p>
+    <p class="muted" id="reset-error"></p>
+    <div class="dialog-buttons">
+      <button type="button" id="reset-cancel">cancel</button>
+      <button type="button" id="reset-confirm">reset to 10</button>
+    </div>
+  </dialog>
+
+  <script src="/board.js"></script>
+  <script src="/card.js"></script>
+  <script src="/game.js"></script>
+</body>
+</html>

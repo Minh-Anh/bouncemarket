@@ -1,0 +1,24 @@
+[project]
+name = "bouncemarket"
+version = "1.0.0"
+description = "A ball will fall. Trade on where it lands."
+readme = "README.md"
+requires-python = ">=3.11"
+# Each pinned to an exact version. Keep in sync with requirements.txt, which Render installs.
+dependencies = [
+    "httpx==0.28.1",
+    "pillow==12.0.0",
+    "starlette==1.10.0",
+    "uvicorn[standard]==0.54.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false  # an app run from this folder, not a library to install
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["e2e: starts the whole server (about a minute in all); leave out with -m 'not e2e'"]

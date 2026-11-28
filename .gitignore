@@ -222,6 +222,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Local copies of the round log and name scans made by the scripts in analyses/
+# Local copies of the round log and name scans made by the scripts in analysis/
 *.pkl
 names*.json
+
+# uv's lock file. Render turns uv on for a service whose repository has one, and this app is
+# built there with pip from requirements.txt (see render.yaml), so the lock stays local.
+uv.lock
