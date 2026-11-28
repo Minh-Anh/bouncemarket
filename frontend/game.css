@@ -1,0 +1,173 @@
+/* The game page's styles (index.html). The best-round card has its own, in card.css. */
+
+/* The whole palette: yellow as the accent, blue for the left side and orange for the right
+   (the buy buttons and the odds bar), and three greys. */
+:root {
+  --background: #111;
+  --panel: #1c1c1c;
+  --text: #eee;
+  --muted: #999;
+  --accent: #fc3;
+  --left: #3987e5;
+  --right: #d95926;
+}
+* { box-sizing: border-box; }
+/* Tapping quickly anywhere on the page doesn't zoom in. Pinching to zoom still works.
+   It's set on every element, not just on html: iOS Safari doesn't always carry it down from
+   the page to what's tapped, and a dialog's backdrop doesn't inherit from the page at all. */
+*, *::before, *::after, ::backdrop { touch-action: manipulation; }
+[hidden] { display: none !important; }  /* without this, a display rule below would un-hide a hidden element */
+body {
+  margin: 0; background: var(--background); color: var(--text);
+  font: 15px/1.4 system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;  /* digits all the same width, so numbers don't jiggle as they change */
+}
+h1, h2, p { margin: 0; }
+h1 { font-size: 18px; }
+/* Everything is written in lowercase, except the LEFT and RIGHT labels on the cards. */
+h2 { font-size: 13px; font-weight: bold; color: var(--muted); }
+.label { font-size: 12px; font-weight: bold; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.muted { color: var(--muted); font-size: 13px; }
+.panel { background: var(--panel); border-radius: 12px; padding: 12px 14px; }
+
+/* Top bar: the title, then on the same line the countdown to the next drop and how many
+   players are online, and at the far right a credit. The bar copies the layout of the two
+   columns below (same widths, gap and wrapping), so its first part is exactly as wide as the
+   game column, with the notes' right edge lined up with the board's, and the credit sits
+   above the sidebar. */
+#page { max-width: 760px; margin: 0 auto; padding: 0 16px 24px; }
+header { display: flex; flex-wrap: wrap; justify-content: center; align-items: baseline; column-gap: 20px; padding: 12px 0; }
+#title-row { flex: 0 1 400px; display: flex; justify-content: space-between; align-items: baseline; column-gap: 12px; }
+/* The notes never wrap onto a second line, which would make the page jump every time the
+   countdown appeared. If they ever don't fit, the end is cut off with "…" instead. */
+#header-notes { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* A dot between the countdown and how many are online, only while both are showing. */
+#countdown:not(:empty) + #online:not(:empty)::before { content: "\00a0·\00a0"; }
+#header-side { flex: 1 1 260px; text-align: right; }  /* as wide as the sidebar, which it sits above */
+.credit { color: var(--muted); font-size: 13px; text-decoration: none; }
+.credit:hover { color: var(--text); text-decoration: underline; }
+/* When the screen is too narrow for two columns, the sidebar wraps under the game. The credit
+   then moves to the bottom of the page, where it doesn't push the board down. 711px is the
+   widest screen that can't fit both columns: 400 + 20 + 260, and 16 of padding each side. */
+#credit-bottom { display: none; }
+@media (max-width: 711px) {
+  #header-side { display: none; }
+  #credit-bottom { display: block; }
+}
+
+/* Two columns side by side: the game, then the leaderboard taking the space that is left.
+   On a narrow screen the leaderboard doesn't fit beside the game, so it wraps underneath. */
+main { display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-start; gap: 20px; }
+#game { flex: 0 1 400px; display: grid; gap: 10px; }
+/* min-width 0 and the minmax column let the sidebar be narrower than its longest leaderboard
+   name, which is cut off with "…" instead of pushing the sidebar under the game or off the screen. */
+#sidebar { flex: 1 1 260px; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+
+/* The board shrinks to fit a small screen, keeping its shape, and never takes more than
+   half the screen's height, so the buy buttons stay in view below it. */
+#board { padding: 20px; }  /* space around the box, so it floats inside the panel */
+@media (max-width: 500px) { #board { padding: 10px; } }  /* on a phone, give that space to the board instead */
+canvas { display: block; margin: 0 auto; max-width: 100%; max-height: 50dvh; }
+
+/* The two halves sit on one line when there is room, and stack on a narrow phone. */
+#status-line { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; column-gap: 12px; font-size: 17px; }
+#status { font-weight: bold; color: var(--accent); }
+#balance { font-weight: bold; }
+
+/* One card per side, stacked: its name, its price per share, our holding, and a buy button across the bottom. */
+#market { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.side { display: grid; gap: 4px; }
+.price { font-size: 30px; font-weight: bold; line-height: 1.2; }
+/* Our holding stays on one line, even with what we'd net added after it, so the card never
+   grows and the buy button below it never moves while someone is tapping it. */
+.holding { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.net { color: var(--text); }
+.side button {
+  margin-top: 6px; padding: 10px 6px; border: none; border-radius: 8px;
+  font: inherit; font-weight: bold; color: #111; cursor: pointer;  /* dark text reads better than white on both colors */
+  touch-action: manipulation;  /* stops a quick double tap from zooming the page */
+}
+.side button:active, .side button.pressed { transform: scale(0.97); }
+/* The key that buys on each side, shown after the button's text. Hidden on touch screens,
+   which have no keyboard to press it on. */
+.side button kbd { margin-left: 6px; font: inherit; opacity: 0.6; }
+@media (hover: none) { .side button kbd { display: none; } }
+#left-side button { background: var(--left); }
+#right-side button { background: var(--right); }
+.side button:disabled { opacity: 0.3; cursor: default; }
+
+/* The line under the cards, with a "reset to 10" button at its right while we're out of
+   points. The line is always as tall as the button, so the button appearing or going away
+   doesn't move anything. */
+#market-note { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 22px; }
+#broke-reset {
+  flex: none; padding: 2px 10px; border: none; border-radius: 6px;
+  font: inherit; font-size: 13px; font-weight: bold; line-height: 18px;  /* after font, which would reset it */
+  background: var(--accent); color: #111; cursor: pointer;
+  touch-action: manipulation;
+}
+#broke-error:empty { display: none; }  /* only takes up room when a reset was refused */
+
+/* Market odds: each side's share price is the chance the market gives it, shown as a split bar.
+   Blue and orange are a validated colorblind-safe pair; the percentages label each side too. */
+#odds-labels { display: flex; justify-content: space-between; margin-top: 8px; font-size: 17px; font-weight: bold; }
+#odds-bar { display: flex; gap: 2px; height: 10px; margin-top: 6px; }
+#odds-bar div { transition: flex-grow 0.3s; min-width: 4px; }
+#odds-left { background: var(--left); border-radius: 4px 0 0 4px; }
+#odds-right { background: var(--right); border-radius: 0 4px 4px 0; }
+
+/* Panel headings, with a note (that trading has closed, on the market odds) pushed to the right. */
+.panel-head { display: flex; justify-content: space-between; align-items: baseline; }
+
+/* 16px, not the page's 15px: iOS zooms in on any text box smaller than that when it's tapped. */
+#name { width: 100%; font: inherit; font-size: 16px; padding: 6px 10px; border-radius: 8px; border: none; margin-bottom: 8px; }
+
+/* The "set username" button on a guest's own leaderboard row, after "you". */
+#leaderboard .claim-button {
+  flex: none; margin-left: 8px; padding: 1px 8px; border: 1px solid var(--accent); border-radius: 6px;
+  font: inherit; font-size: 12px; background: none; color: var(--accent); cursor: pointer;
+}
+#leaderboard .claim-button:hover { background: var(--accent); color: #111; }
+
+/* Each row, on one line: its rank, the name, and the points pushed to the right. A name too
+   long to fit is cut off with "…", so the points never get pushed onto a line of their own.
+   The ranks are written by showLeaderboard(), not by the browser, so their column can be made
+   as wide as the longest rank shown (--rank-digits), keeping every name lined up. */
+#leaderboard { margin: 8px 0 0; padding: 0; list-style: none; }
+#leaderboard li { display: flex; align-items: center; padding: 3px 0; text-transform: lowercase; }  /* names are stored as typed, shown in lowercase */
+#leaderboard .rank { flex: none; width: calc((var(--rank-digits, 2) + 1.2) * 1ch); text-align: right; padding-right: 0.5ch; }
+#leaderboard .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#leaderboard .points { flex: none; margin-left: auto; padding-left: 10px; white-space: nowrap; font-weight: bold; }
+#leaderboard .me { color: var(--accent); }
+#leaderboard-error:not(:empty) { margin-top: 6px; }
+/* The two small buttons on our own row, each just an icon in the row's yellow: a pencil
+   right after our name, to change it, and the reset button just left of our points. */
+#leaderboard .reset, #leaderboard .rename {
+  padding: 2px; border: none; background: none; color: inherit;
+  cursor: pointer; vertical-align: -2px; opacity: 0.7;
+  line-height: 0;  /* just as tall as the icon, so our row is no taller than the others */
+}
+#leaderboard .reset { margin-right: 4px; }
+#leaderboard .rename { flex: none; margin-left: 6px; }
+#leaderboard .reset:hover, #leaderboard .rename:hover { opacity: 1; }
+
+/* The confirmation dialog for a reset. */
+dialog { max-width: 320px; border: none; border-radius: 12px; padding: 18px; background: var(--panel); color: var(--text); }
+dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+dialog h2 { margin-bottom: 8px; color: var(--text); }
+dialog p { margin-bottom: 8px; }
+.dialog-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.dialog-buttons button { font: inherit; padding: 6px 12px; border: none; border-radius: 8px; cursor: pointer; }
+#reset-cancel, #claim-cancel { background: #333; color: var(--text); }
+#reset-confirm, #claim-confirm { background: var(--accent); color: #111; font-weight: bold; }
+
+#leaderboard .gap { color: var(--muted); }  /* the "…" between the top 10 and the rows around you */
+
+/* The banner the owner can put up before a system update (see showNotice()), above the game.
+   Unlike the rest of the page it isn't lowercase: it's the site speaking, not the game.
+   #waiting is the same for a page the server has no room for yet (see connect()). */
+#notice, #waiting { margin-bottom: 14px; border: 1px solid var(--accent); font-size: 14px; }
+#notice button {
+  padding: 0; border: none; background: none; font: inherit; font-weight: bold;
+  color: var(--accent); text-decoration: underline; cursor: pointer;
+}
