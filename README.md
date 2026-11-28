@@ -71,7 +71,7 @@ Anyone can play straight away, and is ranked on the leaderboard from the start: 
 
 A username is 1 to 16 plain letters (A to Z, either case), numbers, `-` or `_`, with at least one letter or number. The page drops any other character as you type. Some names are reserved because they would look like the site itself talking (`you`, `guest`, `admin`, `moderator` and the like), and a word filter turns down slurs, obscenities and hate symbols, including the usual disguises such as numbers for letters. The rules are in `names.py`. They are checked only when a name is set or changed, so a name saved before a rule existed stays as it is, unless the owner changes it (see [Moderating names](#moderating-names)). If the owner has changed your name, it is locked and you can't change it yourself.
 
-Anyone can start over with 10 points, whatever they have now, named or not. The circling-arrows button on your own leaderboard row does it, asking first only if you have more than 10 points to lose. If you can't afford a share on either side and hold none, a "reset to 10" button also appears under the buy buttons. A reset can't be used while you hold shares in the round being played, or someone could spend everything pushing a price around, start over, and do it again for free. A guest's reset changes nothing in the database and nothing on anyone else's leaderboard, only their own.
+Anyone can start over with 10 points, whatever they have now, named or not. The circling-arrows button on your own leaderboard row does it, asking first only if you have more than 10 points to lose. If you can't afford a share on either side and hold none, a "reset to 10" button also appears under the buy buttons. A reset can't be used while you hold shares in the round being played, or someone could spend everything pushing a price around, start over, and do it again for free. Nor more than once every 10 minutes, or more than 6 times an hour from one internet address (see [Limits on resets and buys](#limits-on-resets-and-buys)). A guest's reset changes nothing in the database and nothing on anyone else's leaderboard, only their own.
 
 ## Your best round
 
@@ -206,6 +206,23 @@ Once a minute, if anyone was turned away or one address holds many pages, the se
 `1203 pages open from 961 addresses (the limits are 1500, and 20 from one address). Most from one address: 203.0.113.7 has 20. Turned away 2950 connections from 3 addresses in the last 60 seconds: 2948 from 203.0.113.7, ...`
 
 A few addresses turned away thousands of times is one person's script. If the line says many pages "came with no address", the headers aren't what the server expects and the limit per address isn't working. The limits are per address, so they don't stop a flood from thousands of different addresses: that needs a filter in front of the server, such as Cloudflare's rate limiting.
+
+## Limits on resets and buys
+
+Every player starts with 10 points, and can reset to 10 whenever they hold no shares. In 1,200 rounds on 28 November 2026, 24 guests spent their 10 points every round, each on 10 shares bought at once, early and on either side, paying 0.75 to 0.85 for shares that won less than half the time, and reset to 10 between rounds. Together they lost 26.5 points a round, about six times what the market maker gives away. Three players made all their profit taking the other side of those bursts, within a few hundredths of a second: before any broadcast could have shown them the burst, and almost never after anyone else's of the same size. Whether one person ran both sides, or the three watched the price some faster way and the guests were someone's careless script, free points were being turned into real ones.
+
+Four limits make that slow and costly, all settable as environment variables on the host, and `0` turns each off:
+
+| Variable | Default | |
+| --- | --- | --- |
+| `MAX_BUYS_PER_ADDRESS` | 20 | The most buys in any one second from all the players at one internet address together, on top of each player's own 10 (`MAX_BUYS_PER_SECOND`). Past it a buy gets `429`. A household, an office or a classroom shares one address; 20 is two people clicking as fast as anyone can. |
+| `RESET_COOLDOWN_SECONDS` | 600 | How long a player waits after a reset before they can reset again. A refused reset says how many minutes are left. |
+| `MAX_RESETS_PER_ADDRESS` | 6 | The most resets in any hour from all the players at one internet address together. |
+| `MAX_NEW_GUESTS_PER_ADDRESS` | 20 | The most new guests in any hour from one internet address. A new browser is a new guest with 10 points, so without it one person could make as many as they liked. A page past the limit gets `429`, says so, and keeps trying, as one past the [limit on open pages](#limits-on-open-pages) does. Players the server already knows, and players with a saved name, aren't counted. |
+
+The address is worked out as for the [limits on open pages](#limits-on-open-pages), and with none to go by (as on your own computer) only the limits for each player apply. A player's last reset goes with them when the game moves to a new server; the counts for each address start afresh.
+
+Someone with many internet addresses can still get round all four, but each address then brings only so many free points an hour.
 
 ## Announcing an update
 

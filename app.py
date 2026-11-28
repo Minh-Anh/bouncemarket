@@ -57,6 +57,12 @@ BUFFER_FRAMES = 12  # ball positions are sent this many frames early, so the pag
 RULES_VERSION = 4  # saved with each round; change it whenever the pricing or the counterparty changes, so analysis.py replays each round under its own rules
 PRICE_SOFTNESS = 7  # how many more shares one side needs than the other for its price to reach 0.73 (see prices_for()); higher makes each share move the price less
 MAX_BUYS_PER_SECOND = 10  # the most buys one player can make in any one second; a person clicks 5 to 8.5 times a second, a script far faster
+# Limits that stop one person turning free points into real ones (see "Limits on resets and buys"
+# in the README). Each can be set on the host without changing the code; 0 for no limit.
+MAX_BUYS_PER_ADDRESS = int(os.environ.get("MAX_BUYS_PER_ADDRESS", 20))  # the most buys all the players at one internet address can make in any one second
+RESET_COOLDOWN_SECONDS = int(os.environ.get("RESET_COOLDOWN_SECONDS", 10 * 60))  # how long a player waits after a reset before they can reset again
+MAX_RESETS_PER_ADDRESS = int(os.environ.get("MAX_RESETS_PER_ADDRESS", 6))  # the most resets all the players at one internet address can make in any hour
+MAX_NEW_GUESTS_PER_ADDRESS = int(os.environ.get("MAX_NEW_GUESTS_PER_ADDRESS", 20))  # the most new guests, each with 10 free points, from one internet address in any hour
 # Limits on open pages, so that nobody can slow the game for everyone by opening thousands (see
 # take_slot()). Both can be set on the host without changing the code; 0 for no limit per address.
 MAX_STREAMS = int(os.environ.get("MAX_STREAMS", 1500))  # the most pages open at once. Past it a new page is told the game is full, and keeps trying. Set it to what the server can carry
@@ -246,6 +252,15 @@ saved_ids = set()
 # When each player made their buys in the last second, {player_id: deque of time.monotonic()},
 # so buy() can turn down a player buying faster than MAX_BUYS_PER_SECOND. Emptied every round.
 recent_buys = {}
+# The same for each internet address, all its players' buys together, {address: deque of
+# time.monotonic()}, for MAX_BUYS_PER_ADDRESS. Emptied every round.
+recent_address_buys = {}
+# When each internet address's players reset their points in the last hour, {address: deque of
+# time.time()}, for MAX_RESETS_PER_ADDRESS. Not handed over in an update, so a new server
+# starts it afresh.
+recent_resets = {}
+# The same for new guests from each address, for MAX_NEW_GUESTS_PER_ADDRESS (see admit_new_guest()).
+recent_new_guests = {}
 
 # One entry per open page: a queue of messages waiting to be sent to it, and whose page it is.
 # Each message in a queue is (text, tag): tag is (started_at, index) for a broadcast during a
@@ -563,6 +578,7 @@ def new_player():
         "loaded": False,
         "name_locked": False,
         "seen": time.time(),
+        "last_reset": 0,  # when they last reset their points (seconds since 1970), or 0 if never
     }
 
 
@@ -862,6 +878,12 @@ def settle():
     game["shares"] = {"left": 0, "right": 0}
     game["last_bucket"] = bucket
     recent_buys.clear()  # nobody can buy between rounds, so nothing in it is still in the last second
+    recent_address_buys.clear()
+    # Forget the addresses whose last reset, or last new guest, was over an hour ago, so the lists don't only grow.
+    long_ago = time.time() - 3600
+    for recent in (recent_resets, recent_new_guests):
+        for address in [address for address, times in recent.items() if not times or times[-1] <= long_ago]:
+            del recent[address]
     for row in rows:
         named_points[row["name"]] = row["points"]
     for queue, player_id in streams.items():
@@ -1743,6 +1765,25 @@ def take_slot(address):
     return JSONResponse({"error": problem}, status_code=status, headers={"Retry-After": "15"})
 
 
+def admit_new_guest(address):
+    """Count one more new guest for this address, and say whether they may come in: at most
+    MAX_NEW_GUESTS_PER_ADDRESS in any hour. Every new guest starts with 10 points, and a new
+    browser is a new guest, so without this one person could make as many as they liked and
+    spend their points pushing prices around for another player to take (see "Limits on resets
+    and buys" in the README). A guest turned away isn't counted, and their page asks again by
+    itself, like one turned away by take_slot()."""
+    if not MAX_NEW_GUESTS_PER_ADDRESS or address is None:
+        return True
+    now = time.time()
+    times = recent_new_guests.setdefault(address, collections.deque())
+    while times and times[0] <= now - 3600:
+        times.popleft()
+    if len(times) >= MAX_NEW_GUESTS_PER_ADDRESS:
+        return False
+    times.append(now)
+    return True
+
+
 def give_back_slot(address):
     global slots_taken
     slots_taken -= 1
@@ -1800,6 +1841,7 @@ async def events(request):
     when the page connects, and again whenever a round becomes their new best.
 
     Only so many pages can be open at once, and so many from one address: see take_slot().
+    And only so many new guests can come from one address in an hour: see admit_new_guest().
     """
     player_id = parse_id(request.query_params.get("player"))
     if player_id is None:
@@ -1809,7 +1851,15 @@ async def events(request):
     if refusal:
         return refusal
     try:
+        new = player_id not in players
         player = await get_player(player_id)
+        # Someone we have never seen, and who has no saved name: a new guest, with 10 free points.
+        if new and player["name"] is None and not admit_new_guest(address):
+            if players.get(player_id) is player and not player["spent"]:
+                del players[player_id]  # nothing to keep: they never played
+            give_back_slot(address)
+            turned_away[address] += 1
+            return JSONResponse({"error": "too many new players from your network lately."}, status_code=429, headers={"Retry-After": "15"})
         await get_best_round(player_id)
     except BaseException:
         give_back_slot(address)
@@ -1859,14 +1909,26 @@ async def buy(request):
     frame = current_frame()  # read the clock once, so the logged frame is the one the price was worked out at
     if not betting_open(frame):
         return JSONResponse({"error": "trading is closed."}, status_code=400)
-    # At most MAX_BUYS_PER_SECOND in any one second, so a script can't flood the market.
+    # At most MAX_BUYS_PER_SECOND in any one second, so a script can't flood the market. And at
+    # most MAX_BUYS_PER_ADDRESS from all the players at one internet address together, so that
+    # one person can't get round it, or push the price around with many players' free points.
     now = time.monotonic()
     times = recent_buys.setdefault(player_id, collections.deque())
     while times and times[0] <= now - 1:
         times.popleft()
     if len(times) >= MAX_BUYS_PER_SECOND:
         return JSONResponse({"error": "too many buys at once, slow down."}, status_code=429)
+    address = client_address(request)
+    address_times = None
+    if MAX_BUYS_PER_ADDRESS and address is not None:
+        address_times = recent_address_buys.setdefault(address, collections.deque())
+        while address_times and address_times[0] <= now - 1:
+            address_times.popleft()
+        if len(address_times) >= MAX_BUYS_PER_ADDRESS:
+            return JSONResponse({"error": "too many buys from your network at once, slow down."}, status_code=429)
     times.append(now)
+    if address_times is not None:
+        address_times.append(now)
     player["seen"] = time.time()
     price = costs(frame)[side]
     if price > player["points"]:
@@ -1964,12 +2026,22 @@ async def set_name(request):
     return JSONResponse(player)
 
 
+def minutes(seconds):
+    """A wait as a person would say it, rounded up to whole minutes: "1 minute", "7 minutes"."""
+    count = max(1, math.ceil(seconds / 60))
+    return f"{count} minute" if count == 1 else f"{count} minutes"
+
+
 async def reset_points(request):
     """Start a player over with 10 points, whatever they had before. Guests too, so someone
     who loses everything before claiming a name isn't stuck.
 
     Not while they hold shares in the round being played. Otherwise someone could spend all
-    their points pushing a price around, reset, and do it again for free.
+    their points pushing a price around, reset, and do it again for free. And not too often:
+    once every RESET_COOLDOWN_SECONDS for each player, and MAX_RESETS_PER_ADDRESS an hour for
+    all the players at one internet address together. Players did spend their 10 points every
+    round, many players at once, and reset between rounds, and the price they pushed around was
+    there for others to take (see "Limits on resets and buys" in the README).
     """
     data = await read_json(request)
     player_id = parse_id(data.get("player"))
@@ -1978,6 +2050,19 @@ async def reset_points(request):
         return JSONResponse({"error": "unknown player."}, status_code=400)
     if player["spent"] > 0:
         return JSONResponse({"error": "you can reset once this round is over."}, status_code=400)
+    now = time.time()
+    wait = player["last_reset"] + RESET_COOLDOWN_SECONDS - now
+    if RESET_COOLDOWN_SECONDS and wait > 0:
+        return JSONResponse({"error": f"you can reset again in {minutes(wait)}."}, status_code=429)
+    address = client_address(request)
+    if MAX_RESETS_PER_ADDRESS and address is not None:
+        times = recent_resets.setdefault(address, collections.deque())
+        while times and times[0] <= now - 3600:
+            times.popleft()
+        if len(times) >= MAX_RESETS_PER_ADDRESS:
+            return JSONResponse({"error": f"too many resets from your network lately. try again in {minutes(times[0] + 3600 - now)}."}, status_code=429)
+        times.append(now)
+    player["last_reset"] = now
     player["points"] = 10
     if not player["name"]:
         # A guest has nothing saved in the database, and is on no leaderboard but their own,

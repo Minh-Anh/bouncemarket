@@ -205,7 +205,7 @@
   </header>
 
   <p class="panel" id="notice" role="status" hidden></p>
-  <p class="panel" id="waiting" role="status" hidden>The game is full right now, or too many pages are open from your network. This page will keep trying, and joins as soon as there's room.</p>
+  <p class="panel" id="waiting" role="status" hidden>The game is full right now, or too many pages are open, or too many new players have joined, from your network. This page will keep trying, and joins as soon as there's room.</p>
 
   <main>
     <section id="game">
@@ -794,7 +794,8 @@
       const waiting = document.getElementById("waiting");
       stream.onopen = () => { waiting.hidden = true; };
       // The browser gives up, for good, only when the server answers but won't open a stream:
-      // it is full, or too many pages are open from our network (see take_slot() in app.py).
+      // it is full, or too many pages are open from our network (see take_slot() in app.py), or
+      // too many new players have come from it lately (see admit_new_guest()).
       // Then we say so and ask again ourselves, each page after a different wait.
       stream.onerror = () => {
         if (stream.readyState !== EventSource.CLOSED) return;  // just a dropped connection, which the browser retries
